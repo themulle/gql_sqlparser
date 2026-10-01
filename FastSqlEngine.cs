@@ -141,4 +141,14 @@ public sealed class FastSqlEngine
         ParseTreeWalker.Default.Walk(listener, tree);
         return listener.GetSecuredSql();
     }
+
+    /// <summary>
+    /// Analyzes a SQL query AST for statement type, referenced physical tables, projected columns, and query metrics.
+    /// </summary>
+    public Analysis.SqlQueryMetadata Analyze(ReadOnlyMemory<char> sql)
+    {
+        var (tree, _) = Parse(sql);
+        var analyzer = new Analysis.SqlQueryAnalyzer();
+        return analyzer.Analyze(tree);
+    }
 }

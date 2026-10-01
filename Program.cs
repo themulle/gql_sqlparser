@@ -6,7 +6,7 @@ using Antlr4.Runtime.Tree;
 
 public static class Program
 {
-    public static void Main(string[] args)
+    public static void RunDemo(string[] args)
     {
         Console.WriteLine("=== TrinoSqlEngine (.NET 10 / ANTLR4) ===");
 

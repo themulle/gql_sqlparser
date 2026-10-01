@@ -1,6 +1,7 @@
 namespace TrinoSqlEngine;
 
 using System;
+using System.Collections.Generic;
 
 public interface IRlsPolicyProvider
 {
@@ -47,12 +48,76 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
     }
 }
 
+public interface IColumnMaskingPolicyProvider
+{
+    bool HasMask(string tableName, string columnName);
+    string GetMaskedExpression(string tableName, string columnName);
+}
+
+public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyProvider
+{
+    private readonly Func<string, string, bool> _hasMaskPredicate;
+    private readonly Func<string, string, string> _maskExpressionProvider;
+
+    public DefaultColumnMaskingPolicyProvider(
+        Func<string, string, bool> hasMaskPredicate,
+        Func<string, string, string> maskExpressionProvider)
+    {
+        _hasMaskPredicate = hasMaskPredicate ?? throw new ArgumentNullException(nameof(hasMaskPredicate));
+        _maskExpressionProvider = maskExpressionProvider ?? throw new ArgumentNullException(nameof(maskExpressionProvider));
+    }
+
+    public bool HasMask(string tableName, string columnName)
+    {
+        if (_hasMaskPredicate(tableName, columnName)) return true;
+
+        int lastDot = tableName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        {
+            string simpleName = tableName[(lastDot + 1)..];
+            if (_hasMaskPredicate(simpleName, columnName)) return true;
+        }
+
+        return false;
+    }
+
+    public string GetMaskedExpression(string tableName, string columnName)
+    {
+        int lastDot = tableName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        {
+            string simpleName = tableName[(lastDot + 1)..];
+            if (_hasMaskPredicate(simpleName, columnName))
+            {
+                return _maskExpressionProvider(simpleName, columnName);
+            }
+        }
+
+        return _maskExpressionProvider(tableName, columnName);
+    }
+}
+
 public sealed class RlsOptions
 {
     /// <summary>
     /// Policy provider that determines whether and how a table is filtered.
     /// </summary>
     public IRlsPolicyProvider PolicyProvider { get; set; } = new DefaultRlsPolicyProvider();
+
+    /// <summary>
+    /// Column masking provider that provides SQL masking expressions (e.g. 'NULL', '***', or hash).
+    /// </summary>
+    public IColumnMaskingPolicyProvider? ColumnMaskingProvider { get; set; }
+
+    /// <summary>
+    /// Callback returning the known column schema for a given table, enabling full in-database AST column pushdown.
+    /// </summary>
+    public Func<string, IReadOnlyList<string>?>? TableColumnsProvider { get; set; }
+
+    /// <summary>
+    /// Clamps or injects LIMIT {maxRows} on top-level queries to prevent result set exhaustion attacks (0 = disabled).
+    /// </summary>
+    public long EnforcedMaxRows { get; set; } = 0;
 
     /// <summary>
     /// SEC-01: When true, throws an exception if non-SELECT statements (INSERT, UPDATE, DELETE, DDL) are passed to the RLS rewriter.

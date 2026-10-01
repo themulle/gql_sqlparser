@@ -100,17 +100,84 @@ public sealed class RlsListener : SqlBaseBaseListener
         _cteScopeStack.Peek().Add(cteName);
     }
 
+    private int _subqueryDepth = 0;
+    private bool _rootLimitHandled = false;
+
+    public override void EnterSubquery(SqlBaseParser.SubqueryContext context)
+    {
+        _subqueryDepth++;
+    }
+
+    public override void ExitSubquery(SqlBaseParser.SubqueryContext context)
+    {
+        if (_subqueryDepth > 0) _subqueryDepth--;
+    }
+
+    public override void EnterSubqueryRelation(SqlBaseParser.SubqueryRelationContext context)
+    {
+        _subqueryDepth++;
+    }
+
+    public override void ExitSubqueryRelation(SqlBaseParser.SubqueryRelationContext context)
+    {
+        if (_subqueryDepth > 0) _subqueryDepth--;
+    }
+
+    public override void EnterQueryNoWith(SqlBaseParser.QueryNoWithContext context)
+    {
+        if (_options.EnforcedMaxRows > 0 && _subqueryDepth == 0 && !_rootLimitHandled)
+        {
+            if (context.limit != null)
+            {
+                _rootLimitHandled = true;
+                if (context.limit.rowCount() != null)
+                {
+                    string text = context.limit.rowCount().GetText();
+                    if (long.TryParse(text, out long existingVal))
+                    {
+                        if (existingVal > _options.EnforcedMaxRows)
+                        {
+                            _rewriter.Replace(context.limit.rowCount().Start, context.limit.rowCount().Stop, _options.EnforcedMaxRows.ToString());
+                        }
+                    }
+                    else
+                    {
+                        _rewriter.Replace(context.limit.rowCount().Start, context.limit.rowCount().Stop, _options.EnforcedMaxRows.ToString());
+                    }
+                }
+                else if (context.limit.ALL() != null)
+                {
+                    _rewriter.Replace(context.limit.ALL().Symbol, _options.EnforcedMaxRows.ToString());
+                }
+            }
+        }
+    }
+
+    public override void ExitQueryNoWith(SqlBaseParser.QueryNoWithContext context)
+    {
+        if (_options.EnforcedMaxRows > 0 && _subqueryDepth == 0 && !_rootLimitHandled)
+        {
+            _rootLimitHandled = true;
+            _rewriter.InsertAfter(context.Stop, $" LIMIT {_options.EnforcedMaxRows}");
+        }
+    }
+
     // Standard SELECT relation: FROM orders (relationPrimary: qualifiedName -> #tableName)
     public override void EnterTableName(SqlBaseParser.TableNameContext context)
     {
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
+        if (IsCte(normalizedName))
             return;
 
-        string policyFilter = _options.PolicyProvider.GetPolicyFilter(normalizedName);
-        string replacement = BuildReplacement(context, rawName, policyFilter);
+        bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
+        bool hasMasking = HasMaskingForTable(normalizedName);
+
+        if (!shouldApplyRls && !hasMasking)
+            return;
+
+        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
         _rewriter.Replace(context.Start, context.Stop, replacement);
     }
 
@@ -120,11 +187,16 @@ public sealed class RlsListener : SqlBaseBaseListener
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
+        if (IsCte(normalizedName))
             return;
 
-        string policyFilter = _options.PolicyProvider.GetPolicyFilter(normalizedName);
-        string replacement = BuildReplacement(context, rawName, policyFilter);
+        bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
+        bool hasMasking = HasMaskingForTable(normalizedName);
+
+        if (!shouldApplyRls && !hasMasking)
+            return;
+
+        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
         _rewriter.Replace(context.Start, context.Stop, replacement);
     }
 
@@ -134,11 +206,16 @@ public sealed class RlsListener : SqlBaseBaseListener
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
+        if (IsCte(normalizedName))
             return;
 
-        string policyFilter = _options.PolicyProvider.GetPolicyFilter(normalizedName);
-        string replacement = $"(SELECT * FROM {rawName} WHERE {policyFilter})";
+        bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
+        bool hasMasking = HasMaskingForTable(normalizedName);
+
+        if (!shouldApplyRls && !hasMasking)
+            return;
+
+        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
         _rewriter.Replace(context.qualifiedName().Start, context.qualifiedName().Stop, replacement);
     }
 
@@ -376,8 +453,61 @@ public sealed class RlsListener : SqlBaseBaseListener
         return _cteScopeStack.Peek().Contains(normalizedTableName);
     }
 
-    private string BuildReplacement(ParserRuleContext context, string rawTableName, string policyFilter)
+    private bool HasMaskingForTable(string normalizedTableName)
     {
+        if (_options.ColumnMaskingProvider == null || _options.TableColumnsProvider == null)
+            return false;
+
+        var columns = _options.TableColumnsProvider(normalizedTableName);
+        if (columns == null || columns.Count == 0)
+            return false;
+
+        foreach (var col in columns)
+        {
+            if (_options.ColumnMaskingProvider.HasMask(normalizedTableName, col))
+                return true;
+        }
+
+        return false;
+    }
+
+    private string BuildReplacement(ParserRuleContext context, string rawTableName, string normalizedTableName, bool shouldApplyRls)
+    {
+        string policyFilter = shouldApplyRls ? _options.PolicyProvider.GetPolicyFilter(normalizedTableName) : string.Empty;
+
+        string selectColumns = "*";
+        if (_options.TableColumnsProvider != null)
+        {
+            var columns = _options.TableColumnsProvider(normalizedTableName);
+            if (columns != null && columns.Count > 0)
+            {
+                var projected = new List<string>(columns.Count);
+                foreach (var col in columns)
+                {
+                    if (_options.ColumnMaskingProvider != null && _options.ColumnMaskingProvider.HasMask(normalizedTableName, col))
+                    {
+                        string maskExpr = _options.ColumnMaskingProvider.GetMaskedExpression(normalizedTableName, col);
+                        projected.Add($"{maskExpr} AS {col}");
+                    }
+                    else
+                    {
+                        projected.Add(col);
+                    }
+                }
+                selectColumns = string.Join(", ", projected);
+            }
+        }
+
+        string subquery;
+        if (!string.IsNullOrWhiteSpace(policyFilter))
+        {
+            subquery = $"(SELECT {selectColumns} FROM {rawTableName} WHERE {policyFilter})";
+        }
+        else
+        {
+            subquery = $"(SELECT {selectColumns} FROM {rawTableName})";
+        }
+
         if (_options.AppendTableAlias)
         {
             // SEC-02: Check if relation already has an explicit alias
@@ -389,11 +519,11 @@ public sealed class RlsListener : SqlBaseBaseListener
 
             if (!hasExplicitAlias)
             {
-                return $"(SELECT * FROM {rawTableName} WHERE {policyFilter}) AS {rawTableName}";
+                return $"{subquery} AS {rawTableName}";
             }
         }
 
-        return $"(SELECT * FROM {rawTableName} WHERE {policyFilter})";
+        return subquery;
     }
 
     public string GetSecuredSql() => _rewriter.GetText();
