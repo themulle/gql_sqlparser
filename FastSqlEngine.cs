@@ -25,6 +25,8 @@ public sealed class ThrowingErrorListener : BaseErrorListener, IAntlrErrorListen
 
 public sealed class FastSqlEngine
 {
+    private static readonly DefaultErrorStrategy FallbackErrorStrategy = new();
+
     private readonly ObjectPool<SqlBaseParser> _parserPool = 
         new DefaultObjectPool<SqlBaseParser>(new ParserPooledObjectPolicy());
 
@@ -52,11 +54,7 @@ public sealed class FastSqlEngine
         {
             parser.TokenStream = tokens;
 
-            // Stufe 1: Schneller SLL-Pfad (keine Ambiguitätsprüfung)
-            parser.Interpreter.PredictionMode = PredictionMode.SLL;
-            parser.ErrorHandler = new BailErrorStrategy();
-            parser.RemoveErrorListeners();
-
+            // Stufe 1: Schneller SLL-Pfad (im Pool bereits vorkonfiguriert)
             try
             {
                 var tree = parser.singleStatement();
@@ -67,9 +65,8 @@ public sealed class FastSqlEngine
                 // Stufe 2: Fallback auf LL(*)-Modus
                 tokens.Reset();
                 parser.Reset();
-                parser.RemoveErrorListeners();
                 parser.AddErrorListener(ThrowingErrorListener.Instance);
-                parser.ErrorHandler = new DefaultErrorStrategy();
+                parser.ErrorHandler = FallbackErrorStrategy;
                 parser.Interpreter.PredictionMode = PredictionMode.LL;
                 
                 var tree = parser.singleStatement();
@@ -105,11 +102,7 @@ public sealed class FastSqlEngine
         {
             parser.TokenStream = tokens;
 
-            // Stufe 1: Schneller SLL-Pfad
-            parser.Interpreter.PredictionMode = PredictionMode.SLL;
-            parser.ErrorHandler = new BailErrorStrategy();
-            parser.RemoveErrorListeners();
-
+            // Stufe 1: Schneller SLL-Pfad (im Pool bereits vorkonfiguriert)
             try
             {
                 var tree = parser.standaloneExpression();
@@ -120,9 +113,8 @@ public sealed class FastSqlEngine
                 // Stufe 2: Fallback auf LL(*)-Modus
                 tokens.Reset();
                 parser.Reset();
-                parser.RemoveErrorListeners();
                 parser.AddErrorListener(ThrowingErrorListener.Instance);
-                parser.ErrorHandler = new DefaultErrorStrategy();
+                parser.ErrorHandler = FallbackErrorStrategy;
                 parser.Interpreter.PredictionMode = PredictionMode.LL;
                 
                 var tree = parser.standaloneExpression();
