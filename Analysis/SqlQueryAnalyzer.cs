@@ -156,6 +156,11 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
 
     public override void EnterQuerySpecification(SqlBaseParser.QuerySpecificationContext context)
     {
+        if (context.relation() != null && context.relation().Length > 1)
+        {
+            _joinCount += (context.relation().Length - 1);
+        }
+
         if (_isRootQuerySpecification && _currentSubqueryDepth == 0)
         {
             _isRootQuerySpecification = false;
@@ -192,6 +197,33 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
     public override void EnterJoinCriteria(SqlBaseParser.JoinCriteriaContext context)
     {
         ExtractIdentifiers(context, _joinConditionColumns);
+    }
+
+    public override void EnterComparison(SqlBaseParser.ComparisonContext context)
+    {
+        var op = context.comparisonOperator();
+        if (op != null && (op.EQ() != null || string.Equals(op.GetText(), "=", StringComparison.Ordinal)))
+        {
+            var leftCtx = context.value ?? (context.Parent as SqlBaseParser.PredicatedContext)?.valueExpression();
+            var rightCtx = context.right ?? context.valueExpression();
+
+            if (leftCtx != null && rightCtx != null)
+            {
+                var leftIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var rightIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                ExtractIdentifiers(leftCtx, leftIds);
+                ExtractIdentifiers(rightCtx, rightIds);
+
+                // If identifiers exist on BOTH sides of equality (e.g. a.col = b.col),
+                // this is a relational equijoin predicate (e.g. ANSI-89 comma join in WHERE clause)
+                if (leftIds.Count > 0 && rightIds.Count > 0)
+                {
+                    foreach (var id in leftIds) _joinConditionColumns.Add(id);
+                    foreach (var id in rightIds) _joinConditionColumns.Add(id);
+                }
+            }
+        }
     }
 
     private static void ExtractIdentifiers(Antlr4.Runtime.RuleContext? ctx, HashSet<string> identifiers)
