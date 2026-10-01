@@ -27,7 +27,8 @@ public sealed record SqlQueryMetadata(
     int JoinCount,
     int MaxSubqueryDepth,
     bool HasExplicitLimit,
-    long? ExplicitLimitValue);
+    long? ExplicitLimitValue,
+    IReadOnlySet<string>? JoinConditionColumns = null);
 
 public interface ISqlQueryAnalyzer
 {

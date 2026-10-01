@@ -10,6 +10,7 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
     private readonly List<TableAccessTarget> _referencedTables = new();
     private readonly List<string> _projectedColumns = new();
     private readonly HashSet<string> _seenTableKeys = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _joinConditionColumns = new(StringComparer.OrdinalIgnoreCase);
     private readonly Stack<HashSet<string>> _cteScopeStack = new();
 
     private int _joinCount;
@@ -38,7 +39,8 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
             JoinCount: _joinCount,
             MaxSubqueryDepth: _maxSubqueryDepth,
             HasExplicitLimit: _hasExplicitLimit,
-            ExplicitLimitValue: _explicitLimitValue);
+            ExplicitLimitValue: _explicitLimitValue,
+            JoinConditionColumns: new HashSet<string>(_joinConditionColumns, StringComparer.OrdinalIgnoreCase));
     }
 
     private void Reset()
@@ -47,6 +49,7 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         _referencedTables.Clear();
         _projectedColumns.Clear();
         _seenTableKeys.Clear();
+        _joinConditionColumns.Clear();
         _cteScopeStack.Clear();
         _cteScopeStack.Push(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
         _joinCount = 0;
@@ -184,6 +187,31 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
     public override void EnterJoinRelation(SqlBaseParser.JoinRelationContext context)
     {
         _joinCount++;
+    }
+
+    public override void EnterJoinCriteria(SqlBaseParser.JoinCriteriaContext context)
+    {
+        ExtractIdentifiers(context, _joinConditionColumns);
+    }
+
+    private static void ExtractIdentifiers(Antlr4.Runtime.RuleContext? ctx, HashSet<string> identifiers)
+    {
+        if (ctx == null) return;
+        if (ctx is SqlBaseParser.IdentifierContext id)
+        {
+            string name = SqlIdentifierHelper.NormalizeIdentifier(id.GetText());
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                identifiers.Add(name);
+            }
+        }
+        for (int i = 0; i < ctx.ChildCount; i++)
+        {
+            if (ctx.GetChild(i) is Antlr4.Runtime.RuleContext child)
+            {
+                ExtractIdentifiers(child, identifiers);
+            }
+        }
     }
 
     public override void EnterQueryNoWith(SqlBaseParser.QueryNoWithContext context)
