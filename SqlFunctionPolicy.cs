@@ -27,15 +27,18 @@ public static class SqlFunctionPolicy
         "lo_import", "lo_export", "lo_get", "lo_put", "lo_from_bytea", "lo_open", "lo_unlink",
         // PostgreSQL: remote connections
         "dblink", "dblink_exec", "dblink_connect", "dblink_connect_u", "dblink_send_query", "dblink_open", "dblink_fetch",
-        // PostgreSQL: session state, configuration, process control
+        // PostgreSQL: session state, configuration, process control, notifications, server info (SQ-06)
         "set_config", "current_setting", "pg_sleep", "pg_sleep_for", "pg_sleep_until",
         "pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile",
         "pg_promote", "pg_switch_wal", "pg_create_restore_point", "pg_backend_pid",
         "pg_advisory_lock", "pg_advisory_xact_lock", "pg_try_advisory_lock",
         "pg_logical_emit_message", "pg_file_write", "pg_file_rename", "pg_file_unlink",
-        // SQL Server
+        "pg_notify", "pg_current_logfile", "pg_export_snapshot", "pg_stat_reset",
+        "pg_log_backend_memory_contexts", "inet_server_addr", "version", "txid_current",
+        // SQL Server (SQ-06)
         "xp_cmdshell", "openrowset", "openquery", "opendatasource", "openxml", "sp_executesql",
-        "exec", "execute",
+        "exec", "execute", "fn_dblog", "fn_xe_file_target_read_file", "fn_get_audit_file", "fn_trace_gettable",
+        "has_dbaccess", "suser_sname", "is_srvrolemember", "suser_name", "suser_id", "is_member",
         // MySQL / MariaDB / UDF-based command execution
         "load_file", "sys_exec", "sys_eval", "benchmark", "sleep",
         // Oracle
@@ -49,8 +52,8 @@ public static class SqlFunctionPolicy
     {
         "query_to_xml", "table_to_xml", "cursor_to_xml", "database_to_xml", "schema_to_xml",
         "pg_read_", "pg_ls_", "pg_stat_file", "pg_file_", "pg_terminate_", "pg_cancel_",
-        "pg_advisory_", "pg_try_advisory_", "pg_sleep",
-        "lo_", "dblink", "xp_", "sp_", "dbms_", "utl_",
+        "pg_advisory_", "pg_try_advisory_", "pg_sleep", "pg_get_", "pg_stat_", "pg_replication_",
+        "lo_", "dblink", "xp_", "sp_", "dbms_", "utl_", "fn_dblog", "fn_xe_", "fn_get_audit_", "fn_trace_",
     };
 
     /// <summary>

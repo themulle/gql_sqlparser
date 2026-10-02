@@ -36,9 +36,7 @@ public sealed class FastSqlEngine
     public int MaxQueryLength { get; set; } = 65_536;
 
     /// <summary>
-    /// SEC C-06: Maximum token-level nesting depth (parentheses, brackets, CASE/BEGIN ... END, legacy ARRAY/MAP type
-    /// brackets, lambda arrows and chains of unary operators). Checked before parsing, because the recursive-descent
-    /// parser and the tree walker would otherwise raise an uncatchable StackOverflowException. 0 disables the check.
+    /// SEC C-06 / SQ-08: Maximum token-level nesting depth.
     /// </summary>
     public int MaxNestingDepth { get; set; } = 200;
 
@@ -48,12 +46,35 @@ public sealed class FastSqlEngine
     /// </summary>
     public int MaxParseTreeDepth { get; set; } = 3_000;
 
+    /// <summary>SQ-02: When true, comments are rejected to prevent dialect comment discrepancies.</summary>
+    public bool RejectComments { get; set; } = false;
+
+    /// <summary>SQ-01: When true, backslash escapes in string literals are rejected.</summary>
+    public bool RejectBackslashInStrings { get; set; } = false;
+
+    /// <summary>SQ-01: When true, string type constructors like E'...' are rejected.</summary>
+    public bool RejectEscapedStringLiterals { get; set; } = false;
+
+    /// <summary>SQ-02: When true, dollar-quoted strings ($$...$$) are rejected.</summary>
+    public bool RejectDollarQuoting { get; set; } = false;
+
+    /// <summary>SQ-10: When true, unquoted identifiers with non-ASCII characters are rejected.</summary>
+    public bool RejectNonAsciiIdentifiers { get; set; } = false;
+
+    /// <summary>SQ-11: When true, dots inside quoted identifiers are rejected.</summary>
+    public bool RejectDotsInQuotedIdentifiers { get; set; } = false;
+
+    /// <summary>SQ-13: When true, time-travel syntax (FOR TIMESTAMP/VERSION AS OF) is rejected.</summary>
+    public bool RejectTimeTravelQueries { get; set; } = false;
+
     public (SqlBaseParser.SingleStatementContext Tree, CommonTokenStream Tokens) Parse(ReadOnlyMemory<char> sql)
     {
         if (sql.Length > MaxQueryLength)
         {
             throw new ArgumentOutOfRangeException(nameof(sql), $"SQL query length ({sql.Length}) exceeds the maximum allowed limit of {MaxQueryLength} characters.");
         }
+
+        System.Runtime.CompilerServices.RuntimeHelpers.EnsureSufficientExecutionStack();
 
         var charStream = new ZeroCopyCaseInsensitiveStream(sql);
         var lexer = new SqlBaseLexer(charStream);
@@ -174,13 +195,87 @@ public sealed class FastSqlEngine
         int unaryRun = 0;     // consecutive prefix operators (- + NOT)
         int previousType = 0;
 
+        IToken? lastNonWsToken = null;
+
         foreach (var token in all)
         {
             int type = token.Type;
+            string? text = token.Text;
+
+            // SQ-02: Block comment nesting check (/* ... /* ... */)
+            if (type == SqlBaseLexer.BRACKETED_COMMENT)
+            {
+                if (text != null && text.Length > 4 && text.IndexOf("/*", 2, StringComparison.Ordinal) >= 0)
+                {
+                    throw new ParseCanceledException(
+                        $"line {token.Line}:{token.Column}: Nested block comments ('/* ... /* ... */') are strictly prohibited due to dialect lexer differentials.");
+                }
+            }
+
+            if (RejectComments && (type == SqlBaseLexer.SIMPLE_COMMENT || type == SqlBaseLexer.BRACKETED_COMMENT))
+            {
+                throw new ParseCanceledException(
+                    $"line {token.Line}:{token.Column}: SQL comments are not permitted in governed execution.");
+            }
+
             if (type == SqlBaseLexer.WS || type == SqlBaseLexer.SIMPLE_COMMENT || type == SqlBaseLexer.BRACKETED_COMMENT)
                 continue;
 
-            string? text = token.Text;
+            // SQ-01: Backslash escapes in string literals
+            if (RejectBackslashInStrings && type == SqlBaseLexer.STRING && text != null && text.Contains('\\'))
+            {
+                throw new ParseCanceledException(
+                    $"line {token.Line}:{token.Column}: Backslash escapes in string literals are not permitted due to dialect lexer differentials.");
+            }
+
+            // SQ-01: E'...' / e'...' string type constructor
+            if (RejectEscapedStringLiterals && (type == SqlBaseLexer.STRING || type == SqlBaseLexer.UNICODE_STRING))
+            {
+                if (lastNonWsToken != null && lastNonWsToken.Type == SqlBaseLexer.IDENTIFIER &&
+                    string.Equals(lastNonWsToken.Text, "E", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new ParseCanceledException(
+                        $"line {token.Line}:{token.Column}: Escaped string literal type constructors (E'...') are not permitted due to dialect lexer differentials.");
+                }
+            }
+
+            // SQ-02: Dollar quoting ($$...$$)
+            if (RejectDollarQuoting && type == SqlBaseLexer.DOLLAR_STRING)
+            {
+                throw new ParseCanceledException(
+                    $"line {token.Line}:{token.Column}: Dollar-quoted strings ($$...$$) are not permitted.");
+            }
+
+            // SQ-10: Non-ASCII in unquoted identifier
+            if (RejectNonAsciiIdentifiers && type == SqlBaseLexer.IDENTIFIER && text != null)
+            {
+                for (int ci = 0; ci < text.Length; ci++)
+                {
+                    if (text[ci] > 127)
+                    {
+                        throw new ParseCanceledException(
+                            $"line {token.Line}:{token.Column}: Non-ASCII characters in unquoted identifier '{text}' are not permitted.");
+                    }
+                }
+            }
+
+            // SQ-11: Dots in quoted identifiers ("a.b")
+            if (RejectDotsInQuotedIdentifiers && (type == SqlBaseLexer.QUOTED_IDENTIFIER || type == SqlBaseLexer.BACKQUOTED_IDENTIFIER) && text != null && text.Contains('.'))
+            {
+                throw new ParseCanceledException(
+                    $"line {token.Line}:{token.Column}: Dots inside quoted identifiers ({text}) are not permitted.");
+            }
+
+            // SQ-13: Time-travel queries (FOR TIMESTAMP/VERSION AS OF)
+            if (RejectTimeTravelQueries && (type == SqlBaseLexer.TIMESTAMP || type == SqlBaseLexer.VERSION))
+            {
+                if (lastNonWsToken != null && lastNonWsToken.Type == SqlBaseLexer.FOR)
+                {
+                    throw new ParseCanceledException(
+                        $"line {token.Line}:{token.Column}: Time-travel queries (FOR TIMESTAMP/VERSION AS OF) are not permitted.");
+                }
+            }
+
             bool isUnaryCandidate = false;
 
             if (type == SqlBaseLexer.CASE || type == SqlBaseLexer.BEGIN)
@@ -218,6 +313,7 @@ public sealed class FastSqlEngine
 
             unaryRun = isUnaryCandidate ? unaryRun + 1 : 0;
             previousType = type;
+            lastNonWsToken = token;
 
             int depth = parenDepth + blockDepth + typeDepth + lambdaCount + unaryRun;
             if (depth > MaxNestingDepth)
@@ -262,10 +358,42 @@ public sealed class FastSqlEngine
     /// </summary>
     public string RewriteRls(ReadOnlyMemory<char> sql, RlsOptions? options = null)
     {
-        var (tree, tokens) = Parse(sql);
-        var listener = new RlsListener(tokens, options);
-        ParseTreeWalker.Default.Walk(listener, tree);
-        return listener.GetSecuredSql();
+        bool oldComments = RejectComments;
+        bool oldBackslash = RejectBackslashInStrings;
+        bool oldEscaped = RejectEscapedStringLiterals;
+        bool oldDollar = RejectDollarQuoting;
+        bool oldNonAscii = RejectNonAsciiIdentifiers;
+        bool oldDots = RejectDotsInQuotedIdentifiers;
+        bool oldTimeTravel = RejectTimeTravelQueries;
+
+        if (options != null)
+        {
+            RejectComments = options.RejectComments;
+            RejectBackslashInStrings = options.RejectBackslashInStrings;
+            RejectEscapedStringLiterals = options.RejectEscapedStringLiterals;
+            RejectDollarQuoting = options.RejectDollarQuoting || (options.TargetDialect == TargetSqlDialect.SqlServer);
+            RejectNonAsciiIdentifiers = options.RejectNonAsciiIdentifiers;
+            RejectDotsInQuotedIdentifiers = options.RejectDotsInQuotedIdentifiers;
+            RejectTimeTravelQueries = options.RejectTimeTravelQueries;
+        }
+
+        try
+        {
+            var (tree, tokens) = Parse(sql);
+            var listener = new RlsListener(tokens, options);
+            ParseTreeWalker.Default.Walk(listener, tree);
+            return listener.GetSecuredSql();
+        }
+        finally
+        {
+            RejectComments = oldComments;
+            RejectBackslashInStrings = oldBackslash;
+            RejectEscapedStringLiterals = oldEscaped;
+            RejectDollarQuoting = oldDollar;
+            RejectNonAsciiIdentifiers = oldNonAscii;
+            RejectDotsInQuotedIdentifiers = oldDots;
+            RejectTimeTravelQueries = oldTimeTravel;
+        }
     }
 
     /// <summary>

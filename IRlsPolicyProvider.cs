@@ -15,6 +15,12 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
     private readonly Func<string, bool>? _predicate;
     private readonly Func<string, string>? _filterFunc;
 
+    /// <summary>
+    /// SQ-04: When true, matches unqualified simple name if qualified name does not match.
+    /// Set to false in environments like GovernedSqlExecutionService to prevent cross-schema short-name collisions.
+    /// </summary>
+    public bool FallbackToSimpleName { get; set; } = true;
+
     public DefaultRlsPolicyProvider(
         string defaultFilter = "tenant_id = 42", 
         Func<string, bool>? predicate = null,
@@ -30,12 +36,14 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
         if (_predicate == null) return true;
         if (_predicate(tableName)) return true;
 
-        // If tableName is qualified e.g. "my_schema.orders", also test unqualified simple name "orders"
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName.Substring(lastDot + 1);
-            if (_predicate(simpleName)) return true;
+            int lastDot = tableName.LastIndexOf('.');
+            if (lastDot >= 0 && lastDot < tableName.Length - 1)
+            {
+                string simpleName = tableName.Substring(lastDot + 1);
+                if (_predicate(simpleName)) return true;
+            }
         }
 
         return false;
@@ -59,6 +67,12 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
     private readonly Func<string, string, bool> _hasMaskPredicate;
     private readonly Func<string, string, string> _maskExpressionProvider;
 
+    /// <summary>
+    /// SQ-04: When true, matches unqualified simple name if qualified name does not match.
+    /// Set to false in environments like GovernedSqlExecutionService to prevent cross-schema short-name collisions.
+    /// </summary>
+    public bool FallbackToSimpleName { get; set; } = true;
+
     public DefaultColumnMaskingPolicyProvider(
         Func<string, string, bool> hasMaskPredicate,
         Func<string, string, string> maskExpressionProvider)
@@ -71,11 +85,14 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
     {
         if (_hasMaskPredicate(tableName, columnName)) return true;
 
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName[(lastDot + 1)..];
-            if (_hasMaskPredicate(simpleName, columnName)) return true;
+            int lastDot = tableName.LastIndexOf('.');
+            if (lastDot >= 0 && lastDot < tableName.Length - 1)
+            {
+                string simpleName = tableName[(lastDot + 1)..];
+                if (_hasMaskPredicate(simpleName, columnName)) return true;
+            }
         }
 
         return false;
@@ -83,13 +100,16 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
 
     public string GetMaskedExpression(string tableName, string columnName)
     {
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName[(lastDot + 1)..];
-            if (_hasMaskPredicate(simpleName, columnName))
+            int lastDot = tableName.LastIndexOf('.');
+            if (lastDot >= 0 && lastDot < tableName.Length - 1)
             {
-                return _maskExpressionProvider(simpleName, columnName);
+                string simpleName = tableName[(lastDot + 1)..];
+                if (_hasMaskPredicate(simpleName, columnName))
+                {
+                    return _maskExpressionProvider(simpleName, columnName);
+                }
             }
         }
 
@@ -203,4 +223,74 @@ public sealed class RlsOptions
     /// clause injected by the RLS rewrite.
     /// </summary>
     public bool RejectUnfilteredDml { get; set; } = true;
+
+    /// <summary>
+    /// SQ-05: Target SQL database dialect for AST rewriting (ANSI, PostgreSQL, SQL Server, SQLite).
+    /// </summary>
+    public TargetSqlDialect TargetDialect { get; set; } = TargetSqlDialect.Ansi;
+
+    /// <summary>
+    /// SQ-02: When true, comments are rejected in the input query to prevent comment-based dialect discrepancies.
+    /// </summary>
+    public bool RejectComments { get; set; } = false;
+
+    /// <summary>
+    /// SQ-01: When true (default), backslash escapes in string literals are rejected to prevent PostgreSQL E'...' / standard_conforming_strings lexer differentials.
+    /// </summary>
+    public bool RejectBackslashInStrings { get; set; } = true;
+
+    /// <summary>
+    /// SQ-01: When true (default), string type constructors like E'...' are rejected.
+    /// </summary>
+    public bool RejectEscapedStringLiterals { get; set; } = true;
+
+    /// <summary>
+    /// SQ-02: When true, dollar-quoted strings ($$...$$) are rejected (e.g. For SQL Server targets).
+    /// </summary>
+    public bool RejectDollarQuoting { get; set; } = false;
+
+    /// <summary>
+    /// SQ-07: When true (default), INSERT statements into tables that have custom row-level consent filters (beyond simple tenant isolation) are rejected.
+    /// </summary>
+    public bool RejectConsentFilteredInsert { get; set; } = true;
+
+    /// <summary>
+    /// SQ-07: Table names that have custom row-level consent filters (beyond simple tenant partition).
+    /// Used by <see cref="RejectConsentFilteredInsert"/> to reject unauthorized INSERT statements.
+    /// </summary>
+    public HashSet<string> TablesWithConsentRowFilter { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// SQ-03: When true (default), whole-row references (table or alias used as column/expression) in UPDATE/DELETE are rejected if the table has masked columns.
+    /// </summary>
+    public bool RejectWholeRowReferencesInDml { get; set; } = true;
+
+    /// <summary>
+    /// SQ-03: Table names that have masked columns. Used by <see cref="RejectWholeRowReferencesInDml"/> to reject unauthorized whole-row references.
+    /// </summary>
+    public HashSet<string> TablesWithMaskedColumns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// SQ-10: When true, unquoted identifiers with non-ASCII characters are rejected.
+    /// </summary>
+    public bool RejectNonAsciiIdentifiers { get; set; } = false;
+
+    /// <summary>
+    /// SQ-11: When true, dots inside quoted identifiers are rejected.
+    /// </summary>
+    public bool RejectDotsInQuotedIdentifiers { get; set; } = false;
+
+    /// <summary>
+    /// SQ-13: When true, time-travel syntax (FOR TIMESTAMP/VERSION AS OF) is rejected.
+    /// </summary>
+    public bool RejectTimeTravelQueries { get; set; } = false;
 }
+
+public enum TargetSqlDialect
+{
+    Ansi,
+    PostgreSql,
+    SqlServer,
+    Sqlite
+}
+

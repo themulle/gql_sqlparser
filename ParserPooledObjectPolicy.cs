@@ -36,6 +36,7 @@ public class ParserPooledObjectPolicy : IPooledObjectPolicy<SqlBaseParser>
             parser.ErrorHandler = BailStrategy;
         }
         parser.RemoveErrorListeners();
+        parser.TokenStream = null;
         return true;
     }
 }

@@ -368,8 +368,12 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         string? catalog = null;
         string? schema = null;
         string tableName;
+        if (ids != null && ids.Length >= 4)
+        {
+            throw new Antlr4.Runtime.Misc.ParseCanceledException($"Four-part table names ('{normalizedFullName}') are not permitted.");
+        }
 
-        if (ids != null && ids.Length >= 3)
+        if (ids != null && ids.Length == 3)
         {
             catalog = SqlIdentifierHelper.NormalizeIdentifier(ids[0].GetText());
             schema = SqlIdentifierHelper.NormalizeIdentifier(ids[1].GetText());

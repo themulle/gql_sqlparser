@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Security;
 using Antlr4.Runtime;
+using Antlr4.Runtime.Misc;
 using Antlr4.Runtime.Tree;
 
 public static class SqlIdentifierHelper
@@ -87,14 +88,29 @@ public sealed class RlsListener : SqlBaseBaseListener
 {
     private readonly TokenStreamRewriter _rewriter;
     private readonly RlsOptions _options;
+    private readonly ITokenStream _tokens;
     private readonly Stack<HashSet<string>> _cteScopeStack = new();
     private bool _rootLimitHandled = false;
 
     public RlsListener(ITokenStream tokens, RlsOptions? options = null)
     {
+        _tokens = tokens ?? throw new ArgumentNullException(nameof(tokens));
         _rewriter = new TokenStreamRewriter(tokens);
         _options = options ?? new RlsOptions();
         _cteScopeStack.Push(new HashSet<string>(StringComparer.Ordinal));
+
+        // SQ-02: Strict rejection of comments when configured
+        if (_options.RejectComments)
+        {
+            for (int i = 0; i < tokens.Size; i++)
+            {
+                var tok = tokens.Get(i);
+                if (tok.Type == SqlBaseLexer.SIMPLE_COMMENT || tok.Type == SqlBaseLexer.BRACKETED_COMMENT)
+                {
+                    throw new ParseCanceledException($"line {tok.Line}:{tok.Column}: SQL comments are not permitted in governed execution.");
+                }
+            }
+        }
     }
 
     // SEC-01: Statement validation based on EnforceReadOnlyQueries
@@ -222,16 +238,33 @@ public sealed class RlsListener : SqlBaseBaseListener
         {
             _rootLimitHandled = true;
             var rowCount = context.limit.rowCount();
-            if (rowCount != null)
+            long effectiveVal = _options.EnforcedMaxRows;
+            if (rowCount != null && long.TryParse(rowCount.GetText(), out long existingVal) && existingVal < effectiveVal)
             {
-                if (!long.TryParse(rowCount.GetText(), out long existingVal) || existingVal > _options.EnforcedMaxRows)
-                {
-                    _rewriter.Replace(rowCount.Start, rowCount.Stop, maxRows);
-                }
+                effectiveVal = existingVal;
             }
-            else if (context.limit.ALL() != null)
+            string limitVal = effectiveVal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            if (_options.TargetDialect == TargetSqlDialect.SqlServer)
             {
-                _rewriter.Replace(context.limit.ALL().Symbol, maxRows);
+                string tsqlLimit = context.orderBy() != null
+                    ? $"OFFSET 0 ROWS FETCH NEXT {limitVal} ROWS ONLY"
+                    : $"ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT {limitVal} ROWS ONLY";
+                _rewriter.Replace(context.LIMIT().Symbol, context.limit.Stop, tsqlLimit);
+            }
+            else
+            {
+                if (rowCount != null)
+                {
+                    if (!long.TryParse(rowCount.GetText(), out long parsedVal) || parsedVal > _options.EnforcedMaxRows)
+                    {
+                        _rewriter.Replace(rowCount.Start, rowCount.Stop, maxRows);
+                    }
+                }
+                else if (context.limit.ALL() != null)
+                {
+                    _rewriter.Replace(context.limit.ALL().Symbol, maxRows);
+                }
             }
         }
         else if (context.FETCH() != null)
@@ -258,7 +291,21 @@ public sealed class RlsListener : SqlBaseBaseListener
         if (_options.EnforcedMaxRows > 0 && !_rootLimitHandled && IsRootReadQueryNoWith(context))
         {
             _rootLimitHandled = true;
-            _rewriter.InsertAfter(context.Stop, $" LIMIT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            if (_options.TargetDialect == TargetSqlDialect.SqlServer)
+            {
+                if (context.orderBy() != null)
+                {
+                    _rewriter.InsertAfter(context.Stop, $" OFFSET 0 ROWS FETCH NEXT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)} ROWS ONLY");
+                }
+                else
+                {
+                    _rewriter.InsertAfter(context.Stop, $" ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)} ROWS ONLY");
+                }
+            }
+            else
+            {
+                _rewriter.InsertAfter(context.Stop, $" LIMIT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            }
         }
     }
 
@@ -411,6 +458,24 @@ public sealed class RlsListener : SqlBaseBaseListener
     // DML: INSERT INTO <table> [(col1, ...)] <query>
     public override void EnterInsertInto(SqlBaseParser.InsertIntoContext context)
     {
+        string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
+        string simpleTableName = normalizedName;
+        int lastDot = simpleTableName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
+        {
+            simpleTableName = simpleTableName.Substring(lastDot + 1);
+        }
+
+        // SQ-07: Reject INSERT on tables that have custom row-level consent filters beyond simple tenant partition
+        if (_options.RejectConsentFilteredInsert && _options.TablesWithConsentRowFilter.Count > 0)
+        {
+            if (_options.TablesWithConsentRowFilter.Contains(normalizedName) ||
+                _options.TablesWithConsentRowFilter.Contains(simpleTableName))
+            {
+                throw new SecurityException($"INSERT into table '{normalizedName}' with custom row-level consent filter is not permitted.");
+            }
+        }
+
         if (!_options.EnforceWithCheckOption)
             return;
 
@@ -816,12 +881,19 @@ public sealed class RlsListener : SqlBaseBaseListener
     }
 
     /// <summary>
-    /// SEC H-15: Rejects DML that references masked (or denied, i.e. masked as NULL) columns of the target table.
+    /// SEC H-15 / SQ-03: Rejects DML that references masked (or denied) columns, or whole-row references to tables with masked columns.
     /// </summary>
     private void EnsureNoMaskedColumnReferences(string normalizedTableName, ParserRuleContext scope, string clause)
     {
         if (!_options.RejectMaskedColumnsInDml || _options.ColumnMaskingProvider == null)
             return;
+
+        string simpleTableName = normalizedTableName;
+        int lastDot = simpleTableName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
+        {
+            simpleTableName = simpleTableName.Substring(lastDot + 1);
+        }
 
         var stack = new Stack<IParseTree>();
         stack.Push(scope);
@@ -839,9 +911,32 @@ public sealed class RlsListener : SqlBaseBaseListener
             if (candidate != null)
             {
                 string column = SqlIdentifierHelper.NormalizeIdentifier(candidate);
-                if (column.Length > 0 && _options.ColumnMaskingProvider.HasMask(normalizedTableName, column))
+                if (column.Length > 0)
                 {
-                    throw new SecurityException($"Masked column '{column}' of table '{normalizedTableName}' must not be referenced in {clause}.");
+                    if (_options.ColumnMaskingProvider.HasMask(normalizedTableName, column))
+                    {
+                        throw new SecurityException($"Masked column '{column}' of table '{normalizedTableName}' must not be referenced in {clause}.");
+                    }
+
+                    // SQ-03: Whole-row reference to the table itself in an expression (e.g. CAST(orders AS text))
+                    if (_options.RejectWholeRowReferencesInDml &&
+                        (node is SqlBaseParser.ColumnReferenceContext || node is SqlBaseParser.DereferenceContext) &&
+                        (column.Equals(normalizedTableName, StringComparison.OrdinalIgnoreCase) ||
+                         column.Equals(simpleTableName, StringComparison.OrdinalIgnoreCase)) &&
+                        HasMaskingForTable(normalizedTableName))
+                    {
+                        throw new SecurityException($"Whole-row reference to '{candidate}' in {clause} is forbidden because table '{normalizedTableName}' contains masked columns.");
+                    }
+                }
+            }
+
+            if (_options.RejectWholeRowReferencesInDml && node is SqlBaseParser.DereferenceContext deref && HasMaskingForTable(normalizedTableName))
+            {
+                string derefText = deref.GetText();
+                if (derefText.Equals(normalizedTableName, StringComparison.OrdinalIgnoreCase) ||
+                    derefText.Equals(simpleTableName, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new SecurityException($"Whole-row reference to '{derefText}' in {clause} is forbidden because table '{normalizedTableName}' contains masked columns.");
                 }
             }
 
@@ -866,17 +961,33 @@ public sealed class RlsListener : SqlBaseBaseListener
 
     private bool HasMaskingForTable(string normalizedTableName)
     {
-        if (_options.ColumnMaskingProvider == null || _options.TableColumnsProvider == null)
+        if (_options.ColumnMaskingProvider == null)
             return false;
 
-        var columns = _options.TableColumnsProvider(normalizedTableName);
-        if (columns == null || columns.Count == 0)
-            return false;
-
-        foreach (var col in columns)
+        string simpleTableName = normalizedTableName;
+        int lastDot = simpleTableName.LastIndexOf('.');
+        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
         {
-            if (_options.ColumnMaskingProvider.HasMask(normalizedTableName, col))
-                return true;
+            simpleTableName = simpleTableName.Substring(lastDot + 1);
+        }
+
+        if (_options.TablesWithMaskedColumns.Contains(normalizedTableName) ||
+            _options.TablesWithMaskedColumns.Contains(simpleTableName))
+        {
+            return true;
+        }
+
+        if (_options.TableColumnsProvider != null)
+        {
+            var columns = _options.TableColumnsProvider(normalizedTableName);
+            if (columns != null)
+            {
+                foreach (var col in columns)
+                {
+                    if (_options.ColumnMaskingProvider.HasMask(normalizedTableName, col))
+                        return true;
+                }
+            }
         }
 
         return false;
@@ -932,7 +1043,15 @@ public sealed class RlsListener : SqlBaseBaseListener
 
             if (!hasExplicitAlias)
             {
-                return $"{subquery} AS {rawTableName}";
+                // SQ-05: Table aliases cannot be dot-qualified (e.g. AS schema.table is invalid across DBs).
+                // Use the unqualified simple table name as alias.
+                string alias = rawTableName;
+                int dotIdx = alias.LastIndexOf('.');
+                if (dotIdx >= 0 && dotIdx < alias.Length - 1)
+                {
+                    alias = alias.Substring(dotIdx + 1);
+                }
+                return $"{subquery} AS {alias}";
             }
         }
 
