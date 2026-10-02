@@ -262,7 +262,9 @@ public class TrinoParserComplianceTests
     {
         var engine = new FastSqlEngine();
         string sql = "SELECT * FROM TABLE(my_ptf(TABLE(orders)))";
-        string secured = engine.RewriteRls(sql.AsMemory());
+        // SEC H-14: table functions are rejected unless allowlisted.
+        var options = new RlsOptions { AllowedTableFunctions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "my_ptf" } };
+        string secured = engine.RewriteRls(sql.AsMemory(), options);
 
         Assert.Equal("SELECT * FROM TABLE(my_ptf(TABLE((SELECT * FROM orders WHERE tenant_id = 42))))", secured);
     }
@@ -271,7 +273,8 @@ public class TrinoParserComplianceTests
     public void Rls_DeleteWithoutWhere_AppendsFilter()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "DELETE FROM orders";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 
@@ -282,7 +285,8 @@ public class TrinoParserComplianceTests
     public void Rls_DeleteWithWhere_InjectsAndWrapsInParentheses()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "DELETE FROM orders WHERE id = 10 OR 1=1";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 
@@ -294,7 +298,8 @@ public class TrinoParserComplianceTests
     public void Rls_UpdateWithoutWhere_AppendsFilter()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "UPDATE orders SET status = 'shipped'";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 

@@ -58,7 +58,7 @@ public sealed class ZeroCopyCaseInsensitiveStream : ICharStream
         {
             if ((uint)_index >= (uint)_length) return IntStreamConstants.EOF;
             char ch = _strSource != null ? _strSource[_strOffset + _index] : _memory.Span[_index];
-            return (uint)(ch - 'a') <= ('z' - 'a') ? (char)(ch - 32) : char.ToUpperInvariant(ch);
+            return (uint)(ch - 'a') <= ('z' - 'a') ? (char)(ch - 32) : ch;
         }
 
         if (i == 0) return 0;
@@ -69,7 +69,7 @@ public sealed class ZeroCopyCaseInsensitiveStream : ICharStream
 
         int target = (int)targetLong;
         char c = _strSource != null ? _strSource[_strOffset + target] : _memory.Span[target];
-        return (uint)(c - 'a') <= ('z' - 'a') ? (char)(c - 32) : char.ToUpperInvariant(c);
+        return (uint)(c - 'a') <= ('z' - 'a') ? (char)(c - 32) : c;
     }
 
     public int Mark() => -1;

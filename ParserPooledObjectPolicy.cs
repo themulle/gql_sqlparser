@@ -11,13 +11,6 @@ public class ParserPooledObjectPolicy : IPooledObjectPolicy<SqlBaseParser>
     public SqlBaseParser Create()
     {
         var parser = new SqlBaseParser(null);
-        // Shared ATN simulator injection
-        parser.SetInterpreter(new ParserATNSimulator(
-            parser, 
-            SharedParserCache.Atn, 
-            SharedParserCache.DecisionToDfa, 
-            SharedParserCache.ContextCache));
-
         parser.Interpreter.PredictionMode = PredictionMode.SLL;
         parser.ErrorHandler = BailStrategy;
         parser.RemoveErrorListeners();
@@ -36,6 +29,7 @@ public class ParserPooledObjectPolicy : IPooledObjectPolicy<SqlBaseParser>
             parser.ErrorHandler = BailStrategy;
         }
         parser.RemoveErrorListeners();
+        parser.TokenStream = null;
         return true;
     }
 }

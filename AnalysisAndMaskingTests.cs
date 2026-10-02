@@ -99,7 +99,8 @@ public class AnalysisAndMaskingTests
         string sql = "SELECT id, email, salary FROM users";
         string secured = _engine.RewriteRls(sql.AsMemory(), options);
 
-        Assert.Contains("(SELECT id, '***@masked.com' AS email, 0 AS salary, tenant_id FROM users WHERE tenant_id = 't1') AS users", secured);
+        // SEC M-24: catalog column names are emitted as delimited identifiers.
+        Assert.Contains("(SELECT \"id\", '***@masked.com' AS \"email\", 0 AS \"salary\", \"tenant_id\" FROM users WHERE tenant_id = 't1') AS users", secured);
     }
 
     [Fact]

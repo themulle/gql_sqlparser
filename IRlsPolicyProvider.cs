@@ -15,6 +15,12 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
     private readonly Func<string, bool>? _predicate;
     private readonly Func<string, string>? _filterFunc;
 
+    /// <summary>
+    /// SQ-04: When true, matches unqualified simple name if qualified name does not match.
+    /// Set to false in environments like GovernedSqlExecutionService to prevent cross-schema short-name collisions.
+    /// </summary>
+    public bool FallbackToSimpleName { get; set; } = true;
+
     public DefaultRlsPolicyProvider(
         string defaultFilter = "tenant_id = 42", 
         Func<string, bool>? predicate = null,
@@ -30,12 +36,10 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
         if (_predicate == null) return true;
         if (_predicate(tableName)) return true;
 
-        // If tableName is qualified e.g. "my_schema.orders", also test unqualified simple name "orders"
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName.Substring(lastDot + 1);
-            if (_predicate(simpleName)) return true;
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _predicate(simpleName)) return true;
         }
 
         return false;
@@ -59,6 +63,12 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
     private readonly Func<string, string, bool> _hasMaskPredicate;
     private readonly Func<string, string, string> _maskExpressionProvider;
 
+    /// <summary>
+    /// SQ-04: When true, matches unqualified simple name if qualified name does not match.
+    /// Set to false in environments like GovernedSqlExecutionService to prevent cross-schema short-name collisions.
+    /// </summary>
+    public bool FallbackToSimpleName { get; set; } = true;
+
     public DefaultColumnMaskingPolicyProvider(
         Func<string, string, bool> hasMaskPredicate,
         Func<string, string, string> maskExpressionProvider)
@@ -71,11 +81,10 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
     {
         if (_hasMaskPredicate(tableName, columnName)) return true;
 
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName[(lastDot + 1)..];
-            if (_hasMaskPredicate(simpleName, columnName)) return true;
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _hasMaskPredicate(simpleName, columnName)) return true;
         }
 
         return false;
@@ -83,11 +92,10 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
 
     public string GetMaskedExpression(string tableName, string columnName)
     {
-        int lastDot = tableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < tableName.Length - 1)
+        if (FallbackToSimpleName)
         {
-            string simpleName = tableName[(lastDot + 1)..];
-            if (_hasMaskPredicate(simpleName, columnName))
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _hasMaskPredicate(simpleName, columnName))
             {
                 return _maskExpressionProvider(simpleName, columnName);
             }
@@ -142,9 +150,9 @@ public sealed class RlsOptions
     public string TenantColumnName { get; set; } = "tenant_id";
 
     /// <summary>
-    /// Expected tenant value for WITH CHECK OPTION verification. Default is "42".
+    /// Expected tenant value for WITH CHECK OPTION verification. Null by default (must be explicitly set when WITH CHECK OPTION is active).
     /// </summary>
-    public string ExpectedTenantValue { get; set; } = "42";
+    public string? ExpectedTenantValue { get; set; } = null;
 
     /// <summary>
     /// If true, strictly forbids setting the tenant column in an UPDATE statement regardless of the assigned value.
@@ -153,7 +161,125 @@ public sealed class RlsOptions
 
     /// <summary>
     /// When true and EnforceWithCheckOption is true, requires INSERT statements to explicitly specify the tenant column.
-    /// Default is false to allow databases with DEFAULT tenant expressions.
+    /// SEC M-23: Default is true (secure default). Set to false only for databases that enforce the tenant via DEFAULT/trigger.
     /// </summary>
-    public bool RequireTenantColumnInInsert { get; set; } = false;
+    public bool RequireTenantColumnInInsert { get; set; } = true;
+
+    /// <summary>
+    /// SEC C-01: When true (default), every function call in the statement is checked against the function policy
+    /// (<see cref="SqlFunctionPolicy"/>). Violations raise a <see cref="System.Security.SecurityException"/>.
+    /// </summary>
+    public bool EnforceFunctionPolicy { get; set; } = true;
+
+    /// <summary>
+    /// SEC C-01: Optional exclusive allowlist of (qualified, case-insensitive) function names.
+    /// When set, only these functions are permitted. SEC P-02: the default denylist always wins, i.e. a denylisted
+    /// function stays rejected even if it is allowlisted. See <see cref="SqlFunctionAllowlists"/> for curated defaults.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedFunctions { get; set; }
+
+    /// <summary>
+    /// SEC C-01: Additional function names that are always rejected (also in allowlist mode).
+    /// </summary>
+    public IReadOnlySet<string>? AdditionalDeniedFunctions { get; set; }
+
+    /// <summary>
+    /// SEC H-14: Allowlist of (qualified, case-insensitive) table function names permitted in TABLE(...) invocations.
+    /// Default null: all table function invocations are rejected.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedTableFunctions { get; set; }
+
+    /// <summary>
+    /// SEC H-14: Allowlist of session property names permitted in WITH SESSION. Default null: WITH SESSION is rejected.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedSessionProperties { get; set; }
+
+    /// <summary>
+    /// SEC H-14: When false (default), inline function definitions (WITH FUNCTION ...) are rejected.
+    /// </summary>
+    public bool AllowInlineFunctionDefinitions { get; set; } = false;
+
+    /// <summary>
+    /// SEC H-15: When true (default), UPDATE/DELETE statements referencing masked columns of the target table
+    /// in SET or WHERE are rejected (prevents copy-out and row-count oracles on masked data).
+    /// </summary>
+    public bool RejectMaskedColumnsInDml { get; set; } = true;
+
+    /// <summary>
+    /// When true (default), UPDATE/DELETE statements without a WHERE clause, or with a trivially true WHERE clause
+    /// (e.g. <c>WHERE 1=1</c>, <c>WHERE true</c>, <c>WHERE id = 5 OR 'a' = 'a'</c>), are rejected with an
+    /// <see cref="UnfilteredDmlException"/>. The check runs on the original statement, independent of the WHERE
+    /// clause injected by the RLS rewrite.
+    /// </summary>
+    public bool RejectUnfilteredDml { get; set; } = true;
+
+    /// <summary>
+    /// SQ-05: Target SQL database dialect for AST rewriting (ANSI, PostgreSQL, SQL Server, SQLite).
+    /// </summary>
+    public TargetSqlDialect TargetDialect { get; set; } = TargetSqlDialect.Ansi;
+
+    /// <summary>
+    /// SQ-02: When true (default, SEC P-06), comments are rejected in the input query to prevent comment-based dialect discrepancies.
+    /// </summary>
+    public bool RejectComments { get; set; } = true;
+
+    /// <summary>
+    /// SQ-01: When true (default), backslash escapes in string literals are rejected to prevent PostgreSQL E'...' / standard_conforming_strings lexer differentials.
+    /// </summary>
+    public bool RejectBackslashInStrings { get; set; } = true;
+
+    /// <summary>
+    /// SQ-01: When true (default), string type constructors like E'...' are rejected.
+    /// </summary>
+    public bool RejectEscapedStringLiterals { get; set; } = true;
+
+    /// <summary>
+    /// SQ-02: When true (default, SEC P-06), dollar-quoted strings ($$...$$) are rejected. Always rejected for SQL Server targets.
+    /// </summary>
+    public bool RejectDollarQuoting { get; set; } = true;
+
+    /// <summary>
+    /// SQ-07: When true (default), INSERT statements into tables that have custom row-level consent filters (beyond simple tenant isolation) are rejected.
+    /// </summary>
+    public bool RejectConsentFilteredInsert { get; set; } = true;
+
+    /// <summary>
+    /// SQ-07: Table names that have custom row-level consent filters (beyond simple tenant partition).
+    /// Used by <see cref="RejectConsentFilteredInsert"/> to reject unauthorized INSERT statements.
+    /// </summary>
+    public HashSet<string> TablesWithConsentRowFilter { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// SQ-03: When true (default), whole-row references (table or alias used as column/expression) in UPDATE/DELETE are rejected if the table has masked columns.
+    /// </summary>
+    public bool RejectWholeRowReferencesInDml { get; set; } = true;
+
+    /// <summary>
+    /// SQ-03: Table names that have masked columns. Used by <see cref="RejectWholeRowReferencesInDml"/> to reject unauthorized whole-row references.
+    /// </summary>
+    public HashSet<string> TablesWithMaskedColumns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// SQ-10: When true (default, SEC P-06), unquoted identifiers with non-ASCII characters are rejected.
+    /// </summary>
+    public bool RejectNonAsciiIdentifiers { get; set; } = true;
+
+    /// <summary>
+    /// SQ-11: When true (default, SEC P-06), dots inside quoted identifiers are rejected.
+    /// </summary>
+    public bool RejectDotsInQuotedIdentifiers { get; set; } = true;
+
+    /// <summary>
+    /// SQ-13: When true (default, SEC P-06), time-travel syntax (FOR TIMESTAMP/VERSION AS OF) is rejected.
+    /// </summary>
+    public bool RejectTimeTravelQueries { get; set; } = true;
 }
+
+public enum TargetSqlDialect
+{
+    Ansi,
+    PostgreSql,
+    SqlServer,
+    Sqlite
+}
+
