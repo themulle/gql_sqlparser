@@ -2,6 +2,7 @@ namespace TrinoSqlEngine.Analysis;
 
 using System;
 using System.Collections.Generic;
+using System.Security;
 using Antlr4.Runtime.Tree;
 
 public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
@@ -128,6 +129,26 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         {
             _functionCalls.Add(name);
         }
+    }
+
+    // SEC P-01: Method call syntax bypasses the function policy and is rejected unconditionally,
+    // unless it is a simple schema-qualified function call (e.g. util.normalize(name)).
+    public override void EnterMethodCall(SqlBaseParser.MethodCallContext context)
+    {
+        if (context.primaryExpression() is SqlBaseParser.ColumnReferenceContext colRef)
+        {
+            var prefix = SqlIdentifierHelper.NormalizeIdentifier(colRef.GetText()).ToLowerInvariant();
+            var method = SqlIdentifierHelper.NormalizeIdentifier(context.methodName().GetText()).ToLowerInvariant();
+            _functionCalls.Add($"{prefix}.{method}");
+            return;
+        }
+
+        throw new SecurityException("Method call syntax (expression.method(...)) is not permitted.");
+    }
+
+    public override void EnterStaticMethodCall(SqlBaseParser.StaticMethodCallContext context)
+    {
+        throw new SecurityException("Static method call syntax (Type::method(...)) is not permitted.");
     }
 
     // SEC H-14: table functions, WITH SESSION and WITH FUNCTION are surfaced for policy decisions.

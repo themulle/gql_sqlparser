@@ -22,6 +22,8 @@ public class SecurityReview20261002SqTests
         RejectDollarQuoting = dialect == TargetSqlDialect.SqlServer,
         RejectConsentFilteredInsert = true,
         RejectWholeRowReferencesInDml = true,
+        // SEC P-06: dots in quoted identifiers are rejected by default; SQ-03 tests use "schema.table" whole-row references.
+        RejectDotsInQuotedIdentifiers = false,
         EnforceReadOnlyQueries = false,
         EnforceWithCheckOption = true,
         ExpectedTenantValue = "42",

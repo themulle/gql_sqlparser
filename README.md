@@ -329,19 +329,35 @@ foreach (var p in parameters)
 | `RequireTenantColumnInInsert` | `bool` | `true` | Requires INSERT statements to explicitly specify the tenant column. |
 | `RejectMaskedColumnsInDml` | `bool` | `true` | Forbids referencing masked columns in `UPDATE SET` or `WHERE` clauses. |
 | `EnforceFunctionPolicy` | `bool` | `true` | Validates every function call against `SqlFunctionPolicy`. |
-| `AllowedFunctions` | `IReadOnlySet<string>?` | `null` | Exclusive allowlist of permitted function names (denylist ignored if set). |
+| `AllowedFunctions` | `IReadOnlySet<string>?` | `null` | Exclusive allowlist of permitted function names. The default denylist always wins. Curated per-dialect lists: `SqlFunctionAllowlists` (`Ansi`, `PostgreSql`, `SqlServer`, `Sqlite`, `Build(dialect, additional)`). |
 | `AdditionalDeniedFunctions` | `IReadOnlySet<string>?` | `null` | Additional function names to strictly reject. |
 | `AllowedTableFunctions` | `IReadOnlySet<string>?` | `null` | Permitted polymorphic table functions (`TABLE(...)`). Default rejects all. |
 | `AllowedSessionProperties` | `IReadOnlySet<string>?` | `null` | Permitted session properties in `WITH SESSION`. Default rejects all. |
 | `AllowInlineFunctionDefinitions` | `bool` | `false` | When false, rejects `WITH FUNCTION ...` inline functions. |
+| `RejectComments` | `bool` | `true` | Rejects SQL comments (SQ-02). |
+| `RejectBackslashInStrings` | `bool` | `true` | Rejects backslashes in string literals (SQ-01). |
+| `RejectEscapedStringLiterals` | `bool` | `true` | Rejects `E'...'` literals (SQ-01). |
+| `RejectDollarQuoting` | `bool` | `true` | Rejects `$$...$$` strings (SQ-02); always rejected for SQL Server targets. |
+| `RejectNonAsciiIdentifiers` | `bool` | `true` | Rejects non-ASCII characters in unquoted identifiers (SQ-10). |
+| `RejectDotsInQuotedIdentifiers` | `bool` | `true` | Rejects dots inside quoted identifiers, e.g. `"a.b"` (SQ-11). |
+| `RejectTimeTravelQueries` | `bool` | `true` | Rejects `FOR TIMESTAMP/VERSION AS OF` (SQ-13). |
+
+`RewriteRls` derives these token switches per call as an immutable `SqlTokenSecurityOptions` object; it never reads or
+modifies the engine's own `Reject*` properties. The engine properties (default `false`) only apply to direct
+`Parse`/`ParseExpression`/`Analyze` calls without explicit `SqlTokenSecurityOptions`, so that plain syntax parsing
+(Trino compliance fixtures) keeps working. Method call syntax (`expr.method(...)`, `Type::method(...)`) is always rejected
+by the rewriter and the analyzer.
 
 ### `FastSqlEngine` Limits
 
 | Property | Type | Default | Description |
 | :--- | :--- | :---: | :--- |
 | `MaxQueryLength` | `int` | `65,536` | Maximum allowed SQL query length in characters. |
-| `MaxNestingDepth` | `int` | `200` | Maximum token-level nesting depth (parentheses, brackets, CASE, lambdas, unary chains). |
+| `MaxNestingDepth` | `int` | `100` | Maximum token-level nesting depth (parentheses, brackets, CASE, lambdas, unary chains). 0 disables only this check; token security checks always run. |
 | `MaxParseTreeDepth` | `int` | `3,000` | Maximum depth of the resulting parse tree (checked iteratively). |
+| `ParseTimeout` | `TimeSpan` | `5 s` | Time budget per parse (incl. waiting for a parser slot). On expiry a `ParseCanceledException` with inner `TimeoutException` is thrown. `<= 0` disables the budget. |
+| `ParseThreadStackSize` | `int` | `16 MB` | Stack size of the dedicated parser thread (minimum 256 KB). |
+| `ParseConcurrencyLimiter` | `SemaphoreSlim?` | `null` | Limits concurrently running parser threads; `null` uses the process-wide `SharedParseConcurrencyLimiter` (`Environment.ProcessorCount * 2`). |
 
 ---
 

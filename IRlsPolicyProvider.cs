@@ -185,7 +185,8 @@ public sealed class RlsOptions
 
     /// <summary>
     /// SEC C-01: Optional exclusive allowlist of (qualified, case-insensitive) function names.
-    /// When set, only these functions are permitted and the default denylist is not consulted.
+    /// When set, only these functions are permitted. SEC P-02: the default denylist always wins, i.e. a denylisted
+    /// function stays rejected even if it is allowlisted. See <see cref="SqlFunctionAllowlists"/> for curated defaults.
     /// </summary>
     public IReadOnlySet<string>? AllowedFunctions { get; set; }
 
@@ -230,9 +231,9 @@ public sealed class RlsOptions
     public TargetSqlDialect TargetDialect { get; set; } = TargetSqlDialect.Ansi;
 
     /// <summary>
-    /// SQ-02: When true, comments are rejected in the input query to prevent comment-based dialect discrepancies.
+    /// SQ-02: When true (default, SEC P-06), comments are rejected in the input query to prevent comment-based dialect discrepancies.
     /// </summary>
-    public bool RejectComments { get; set; } = false;
+    public bool RejectComments { get; set; } = true;
 
     /// <summary>
     /// SQ-01: When true (default), backslash escapes in string literals are rejected to prevent PostgreSQL E'...' / standard_conforming_strings lexer differentials.
@@ -245,9 +246,9 @@ public sealed class RlsOptions
     public bool RejectEscapedStringLiterals { get; set; } = true;
 
     /// <summary>
-    /// SQ-02: When true, dollar-quoted strings ($$...$$) are rejected (e.g. For SQL Server targets).
+    /// SQ-02: When true (default, SEC P-06), dollar-quoted strings ($$...$$) are rejected. Always rejected for SQL Server targets.
     /// </summary>
-    public bool RejectDollarQuoting { get; set; } = false;
+    public bool RejectDollarQuoting { get; set; } = true;
 
     /// <summary>
     /// SQ-07: When true (default), INSERT statements into tables that have custom row-level consent filters (beyond simple tenant isolation) are rejected.
@@ -271,19 +272,19 @@ public sealed class RlsOptions
     public HashSet<string> TablesWithMaskedColumns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// SQ-10: When true, unquoted identifiers with non-ASCII characters are rejected.
+    /// SQ-10: When true (default, SEC P-06), unquoted identifiers with non-ASCII characters are rejected.
     /// </summary>
-    public bool RejectNonAsciiIdentifiers { get; set; } = false;
+    public bool RejectNonAsciiIdentifiers { get; set; } = true;
 
     /// <summary>
-    /// SQ-11: When true, dots inside quoted identifiers are rejected.
+    /// SQ-11: When true (default, SEC P-06), dots inside quoted identifiers are rejected.
     /// </summary>
-    public bool RejectDotsInQuotedIdentifiers { get; set; } = false;
+    public bool RejectDotsInQuotedIdentifiers { get; set; } = true;
 
     /// <summary>
-    /// SQ-13: When true, time-travel syntax (FOR TIMESTAMP/VERSION AS OF) is rejected.
+    /// SQ-13: When true (default, SEC P-06), time-travel syntax (FOR TIMESTAMP/VERSION AS OF) is rejected.
     /// </summary>
-    public bool RejectTimeTravelQueries { get; set; } = false;
+    public bool RejectTimeTravelQueries { get; set; } = true;
 }
 
 public enum TargetSqlDialect

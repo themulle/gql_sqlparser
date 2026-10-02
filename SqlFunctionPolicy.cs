@@ -43,6 +43,24 @@ public static class SqlFunctionPolicy
         "load_file", "sys_exec", "sys_eval", "benchmark", "sleep",
         // Oracle
         "dbms_xmlgen", "dbms_sql", "utl_http", "utl_file", "utl_inaddr", "httpuritype",
+        // SEC P-02 PostgreSQL: SQL text execution (ts_stat), sequence side effects, privilege/catalog/server probing
+        "ts_stat", "ts_debug", "setval", "nextval", "currval", "lastval",
+        "has_table_privilege", "has_column_privilege", "has_any_column_privilege", "has_database_privilege",
+        "has_schema_privilege", "has_function_privilege", "has_sequence_privilege", "has_language_privilege",
+        "has_server_privilege", "has_tablespace_privilege", "has_type_privilege", "has_parameter_privilege",
+        "has_foreign_data_wrapper_privilege", "to_regclass", "to_regproc", "to_regprocedure", "to_regoper",
+        "to_regoperator", "to_regtype", "to_regnamespace", "to_regrole", "to_regcollation",
+        "inet_client_addr", "inet_client_port", "inet_server_port", "current_database", "current_schemas",
+        "current_query", "row_security_active", "txid_current_snapshot", "obj_description", "col_description",
+        "shobj_description", "format_type",
+        // SEC P-02 SQL Server: session context, metadata/definition disclosure, login/host information
+        "session_context", "context_info", "object_definition", "original_login", "host_name", "host_id",
+        "app_name", "serverproperty", "connectionproperty", "loginproperty", "databasepropertyex",
+        "has_perms_by_name", "pwdcompare", "pwdencrypt", "db_name", "db_id", "user_name", "user_id", "suser_sid",
+        "object_id", "object_name", "object_schema_name", "schema_name", "col_name", "decryptbykey",
+        "decryptbypassphrase", "decryptbycert", "decryptbyasymkey", "decryptbykeyautocert",
+        // SEC P-02 SQLite: extension loading, file access (fileio extension), memory DoS
+        "load_extension", "readfile", "writefile", "edit", "zeroblob", "randomblob", "fts3_tokenizer",
     }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
@@ -54,6 +72,8 @@ public static class SqlFunctionPolicy
         "pg_read_", "pg_ls_", "pg_stat_file", "pg_file_", "pg_terminate_", "pg_cancel_",
         "pg_advisory_", "pg_try_advisory_", "pg_sleep", "pg_get_", "pg_stat_", "pg_replication_",
         "lo_", "dblink", "xp_", "sp_", "dbms_", "utl_", "fn_dblog", "fn_xe_", "fn_get_audit_", "fn_trace_",
+        // SEC P-02: all PostgreSQL system functions (pg_logical_slot_*, pg_*), regclass lookups, inet_*, SQLite internals
+        "pg_", "to_reg", "inet_", "sqlite_", "txid_",
     };
 
     /// <summary>
@@ -76,12 +96,16 @@ public static class SqlFunctionPolicy
                 return true;
         }
 
+        // SEC P-02: PostgreSQL privilege probing functions (has_*_privilege)
+        if (simple.StartsWith("has_", StringComparison.Ordinal) && simple.EndsWith("_privilege", StringComparison.Ordinal))
+            return true;
+
         return false;
     }
 
     /// <summary>
     /// Evaluates a function call against the configured policy.
-    /// Order: additional denylist (always wins) -> explicit allowlist (if configured, exclusive) -> default denylist.
+    /// Order: additional denylist and default denylist (always win, SEC P-02) -> explicit allowlist (if configured, exclusive).
     /// </summary>
     public static bool IsFunctionAllowed(string functionName, RlsOptions options)
     {
@@ -97,13 +121,19 @@ public static class SqlFunctionPolicy
             return false;
         }
 
+        // SEC P-02: the default denylist is the second line of defense and also applies in allowlist mode.
+        if (IsDeniedByDefault(full))
+        {
+            return false;
+        }
+
         if (options.AllowedFunctions != null)
         {
             // Allowlist mode: exact (qualified) name match only.
             return ContainsIgnoreCase(options.AllowedFunctions, full);
         }
 
-        return !IsDeniedByDefault(full);
+        return true;
     }
 
     internal static bool ContainsIgnoreCase(IReadOnlySet<string> set, string value)

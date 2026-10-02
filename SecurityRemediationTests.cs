@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security;
+using System.Threading;
 using System.Threading.Tasks;
 using Antlr4.Runtime.Misc;
 using Xunit;
@@ -14,6 +15,10 @@ public class SecurityRemediationTests
     private readonly FastSqlEngine _engine = new();
 
     private static string Repeat(string value, int count) => string.Concat(Enumerable.Repeat(value, count));
+
+    // SEC P-06: RlsOptions rejects dots in quoted identifiers by default (SQ-11). The C-02 tests below verify the CTE
+    // scoping logic for such identifiers and therefore opt out explicitly.
+    private static RlsOptions AllowDottedQuotedIdentifiers() => new() { RejectDotsInQuotedIdentifiers = false };
 
     private static RlsOptions DmlOptions() => new()
     {
@@ -29,7 +34,7 @@ public class SecurityRemediationTests
     {
         string sql = "WITH \"sales.orders\" AS (SELECT 1 x) SELECT * FROM sales.orders";
 
-        string secured = _engine.RewriteRls(sql.AsMemory());
+        string secured = _engine.RewriteRls(sql.AsMemory(), AllowDottedQuotedIdentifiers());
 
         Assert.Contains("(SELECT * FROM sales.orders WHERE tenant_id = 42)", secured);
     }
@@ -52,7 +57,7 @@ public class SecurityRemediationTests
     {
         string sql = "WITH \"Orders\" AS (SELECT 1 x) SELECT * FROM orders";
 
-        string secured = _engine.RewriteRls(sql.AsMemory());
+        string secured = _engine.RewriteRls(sql.AsMemory(), AllowDottedQuotedIdentifiers());
 
         Assert.Contains("(SELECT * FROM orders WHERE tenant_id = 42)", secured);
     }
@@ -62,7 +67,7 @@ public class SecurityRemediationTests
     {
         string sql = "WITH \"sales.orders\" AS (SELECT 1 x) SELECT * FROM \"sales.orders\"";
 
-        string secured = _engine.RewriteRls(sql.AsMemory());
+        string secured = _engine.RewriteRls(sql.AsMemory(), AllowDottedQuotedIdentifiers());
         var meta = _engine.Analyze(sql.AsMemory());
 
         Assert.Equal(sql, secured);
@@ -146,7 +151,8 @@ public class SecurityRemediationTests
     public void C06_DefaultMaxQueryLength_Is64k()
     {
         Assert.Equal(65_536, _engine.MaxQueryLength);
-        Assert.Equal(200, _engine.MaxNestingDepth);
+        // SQ-08: default nesting depth lowered from 200 to 100.
+        Assert.Equal(100, _engine.MaxNestingDepth);
 
         string sql = "SELECT 1 FROM t WHERE x = '" + new string('a', 70_000) + "'";
         Assert.Throws<ArgumentOutOfRangeException>(() => _engine.Parse(sql.AsMemory()));
@@ -539,5 +545,372 @@ public class SecurityRemediationTests
         string secured = _engine.RewriteRls("DELETE FROM orders".AsMemory(), options);
 
         Assert.Equal("DELETE FROM orders WHERE (tenant_id = 42)", secured);
+    }
+
+    // ================================================================ Round 4 (Nachprüfung 2026-10-02)
+
+    // ---------------------------------------------------------------- P-01
+
+    [Theory]
+    [InlineData("SELECT (name).f(1) FROM orders")]
+    [InlineData("SELECT x[1].f() FROM orders")]
+    [InlineData("SELECT mytype::f(1) FROM orders")]
+    public void R4_P01_MethodCallSyntax_IsRejectedByRewriterAndAnalyzer(string sql)
+    {
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls(sql.AsMemory()));
+        Assert.Throws<SecurityException>(() => _engine.Analyze(sql.AsMemory()));
+    }
+
+    [Fact]
+    public void R4_P01_MethodCallSyntax_IsRejectedEvenWithoutFunctionPolicy()
+    {
+        var options = new RlsOptions { EnforceFunctionPolicy = false };
+
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls("SELECT (name).f(1) FROM orders".AsMemory(), options));
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls("SELECT mytype::f(1) FROM orders".AsMemory(), options));
+    }
+
+    [Fact]
+    public void R4_P01_QualifiedFunctionCalls_StillWork()
+    {
+        var options = new RlsOptions
+        {
+            AllowedFunctions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "util.normalize", "upper" }
+        };
+
+        string secured = _engine.RewriteRls("SELECT util.normalize(name), upper(name) FROM orders".AsMemory(), options);
+        var meta = _engine.Analyze("SELECT util.normalize(name), upper(name) FROM orders".AsMemory());
+
+        Assert.Contains("(SELECT * FROM orders WHERE tenant_id = 42)", secured);
+        Assert.Contains("util.normalize", meta.FunctionCalls!);
+    }
+
+    [Fact]
+    public void R4_P01_QualifiedXmlStyleMethod_IsRejectedInAllowlistMode()
+    {
+        // a.f(x) is parsed as a qualified function call; with an allowlist only listed (qualified) names pass.
+        var options = new RlsOptions { AllowedFunctions = SqlFunctionAllowlists.SqlServer };
+
+        Assert.Throws<SecurityException>(() =>
+            _engine.RewriteRls("SELECT doc.value('/a', 'int') FROM orders".AsMemory(), options));
+    }
+
+    // ---------------------------------------------------------------- P-03
+
+    [Theory]
+    [InlineData("SELECT 'a\\b' FROM orders")]
+    [InlineData("SELECT E'abc' FROM orders")]
+    [InlineData("SELECT id FROM orders -- comment")]
+    [InlineData("SELECT $$x$$ FROM orders")]
+    [InlineData("SELECT * FROM \"sales.orders\"")]
+    [InlineData("SELECT * FROM orders FOR VERSION AS OF 1")]
+    public void R4_P03_TokenChecks_RunWhenNestingCheckIsDisabled(string sql)
+    {
+        var engine = new FastSqlEngine { MaxNestingDepth = 0 };
+
+        Assert.ThrowsAny<ParseCanceledException>(() => engine.RewriteRls(sql.AsMemory(), new RlsOptions()));
+    }
+
+    [Fact]
+    public void R4_P03_BackslashCheck_WithNestingDisabled_UsesExplicitTokenOptions()
+    {
+        var engine = new FastSqlEngine { MaxNestingDepth = 0 };
+        var tokenOptions = new SqlTokenSecurityOptions { RejectBackslashInStrings = true };
+
+        var ex = Assert.Throws<ParseCanceledException>(() => engine.Parse("SELECT 'a\\b' FROM orders".AsMemory(), tokenOptions));
+
+        Assert.Contains("Backslash escapes", ex.Message);
+        Assert.NotNull(engine.Parse("SELECT 'a\\b' FROM orders".AsMemory()).Tree);
+    }
+
+    // ---------------------------------------------------------------- P-04
+
+    [Fact]
+    public void R4_P04_RewriteRls_DoesNotMutateEngineSwitches()
+    {
+        var engine = new FastSqlEngine();
+        var strict = new RlsOptions
+        {
+            RejectComments = true,
+            RejectBackslashInStrings = true,
+            RejectEscapedStringLiterals = true,
+            RejectDollarQuoting = true,
+            RejectNonAsciiIdentifiers = true,
+            RejectDotsInQuotedIdentifiers = true,
+            RejectTimeTravelQueries = true
+        };
+
+        engine.RewriteRls("SELECT id FROM orders".AsMemory(), strict);
+        Assert.Throws<ParseCanceledException>(() => engine.RewriteRls("SELECT id FROM orders -- c".AsMemory(), strict));
+
+        Assert.False(engine.RejectComments);
+        Assert.False(engine.RejectBackslashInStrings);
+        Assert.False(engine.RejectEscapedStringLiterals);
+        Assert.False(engine.RejectDollarQuoting);
+        Assert.False(engine.RejectNonAsciiIdentifiers);
+        Assert.False(engine.RejectDotsInQuotedIdentifiers);
+        Assert.False(engine.RejectTimeTravelQueries);
+
+        // Engine defaults (direct parsing) are unaffected by the strict rewrite.
+        Assert.NotNull(engine.Parse("SELECT id FROM orders -- c".AsMemory()).Tree);
+    }
+
+    [Fact]
+    public void R4_P04_ConcurrentRewritesWithDifferentOptions_DoNotInfluenceEachOther()
+    {
+        var engine = new FastSqlEngine();
+        var strict = new RlsOptions { RejectComments = true };
+        var lenient = new RlsOptions { RejectComments = false };
+        var failures = new ConcurrentBag<string>();
+
+        Parallel.For(0, 64, i =>
+        {
+            const string sql = "SELECT id FROM orders -- note";
+            if (i % 2 == 0)
+            {
+                try
+                {
+                    engine.RewriteRls(sql.AsMemory(), strict);
+                    failures.Add($"strict call {i} accepted a comment");
+                }
+                catch (ParseCanceledException)
+                {
+                    // expected
+                }
+            }
+            else
+            {
+                try
+                {
+                    engine.RewriteRls(sql.AsMemory(), lenient);
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"lenient call {i} failed: {ex.Message}");
+                }
+            }
+        });
+
+        Assert.Empty(failures);
+        Assert.False(engine.RejectComments);
+    }
+
+    [Fact]
+    public void R4_P04_TokenOptionsFromRlsOptions_RejectDollarQuotingForSqlServer()
+    {
+        var tokenOptions = SqlTokenSecurityOptions.FromRlsOptions(new RlsOptions
+        {
+            RejectDollarQuoting = false,
+            TargetDialect = TargetSqlDialect.SqlServer
+        });
+
+        Assert.True(tokenOptions.RejectDollarQuoting);
+    }
+
+    // ---------------------------------------------------------------- P-06 / SQ-11 / SQ-13
+
+    [Fact]
+    public void R4_P06_RlsOptions_HaveSecureTokenDefaults()
+    {
+        var options = new RlsOptions();
+
+        Assert.True(options.RejectComments);
+        Assert.True(options.RejectBackslashInStrings);
+        Assert.True(options.RejectEscapedStringLiterals);
+        Assert.True(options.RejectDollarQuoting);
+        Assert.True(options.RejectNonAsciiIdentifiers);
+        Assert.True(options.RejectDotsInQuotedIdentifiers);
+        Assert.True(options.RejectTimeTravelQueries);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM orders FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'", "Time-travel")]
+    [InlineData("SELECT * FROM orders FOR VERSION AS OF 1", "Time-travel")]
+    [InlineData("SELECT * FROM \"sales.orders\"", "Dots inside quoted identifiers")]
+    [InlineData("SELECT id FROM orders /* hidden */", "SQL comments are not permitted")]
+    public void R4_P06_RewriteWithDefaultOptions_RejectsDifferentialSyntax(string sql, string expectedMessage)
+    {
+        var ex = Assert.Throws<ParseCanceledException>(() => _engine.RewriteRls(sql.AsMemory()));
+
+        Assert.Contains(expectedMessage, ex.Message);
+    }
+
+    [Fact]
+    public void R4_P06_DirectParsing_KeepsPermissiveDefaultsForCompliance()
+    {
+        var engine = new FastSqlEngine();
+
+        Assert.NotNull(engine.Parse("SELECT * FROM orders FOR VERSION AS OF 1".AsMemory()).Tree);
+        Assert.NotNull(engine.Parse("SELECT * FROM \"sales.orders\" -- comment".AsMemory()).Tree);
+    }
+
+    // ---------------------------------------------------------------- SQ-08
+
+    [Fact]
+    public void R4_SQ08_DefaultLimits()
+    {
+        var engine = new FastSqlEngine();
+
+        Assert.Equal(100, engine.MaxNestingDepth);
+        Assert.Equal(TimeSpan.FromSeconds(5), engine.ParseTimeout);
+        Assert.Equal(16 * 1024 * 1024, engine.ParseThreadStackSize);
+        Assert.Null(engine.ParseConcurrencyLimiter);
+        Assert.True(FastSqlEngine.DefaultMaxConcurrentParses >= 2);
+    }
+
+    [Fact]
+    public void R4_SQ08_ParseTimeout_AbortsLongParse()
+    {
+        var engine = new FastSqlEngine { ParseTimeout = TimeSpan.FromTicks(1) };
+        string sql = "SELECT * FROM orders WHERE id IN (" + string.Join(", ", Enumerable.Range(0, 5000)) + ")";
+
+        var ex = Assert.ThrowsAny<ParseCanceledException>(() => engine.Parse(sql.AsMemory()));
+        Assert.IsType<TimeoutException>(ex.InnerException);
+
+        // The engine stays usable with a regular budget (pooled parsers are returned by the parser thread).
+        engine.ParseTimeout = TimeSpan.FromSeconds(30);
+        Assert.NotNull(engine.Parse(sql.AsMemory()).Tree);
+    }
+
+    [Fact]
+    public void R4_SQ08_CanceledToken_AbortsParse()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        Assert.ThrowsAny<OperationCanceledException>(() =>
+            _engine.Parse("SELECT id FROM orders".AsMemory(), null, cts.Token));
+    }
+
+    [Fact]
+    public void R4_SQ08_DedicatedParserThread_WithConfiguredStack_ParsesNormalQueries()
+    {
+        var engine = new FastSqlEngine { ParseThreadStackSize = 1024 * 1024 };
+        string nested = "SELECT " + new string('(', 90) + "1" + new string(')', 90) + " FROM orders";
+
+        Assert.NotNull(engine.Parse(nested.AsMemory()).Tree);
+        Assert.NotNull(engine.ParseExpression("a = 1 AND b IN (1, 2, 3)".AsMemory()).Tree);
+        Assert.Contains("tenant_id = 42", engine.RewriteRls("SELECT id FROM orders".AsMemory()));
+
+        string tooDeep = "SELECT " + new string('(', 101) + "1" + new string(')', 101);
+        var ex = Assert.Throws<ParseCanceledException>(() => engine.Parse(tooDeep.AsMemory()));
+        Assert.Contains("nesting depth", ex.Message);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastSqlEngine { ParseThreadStackSize = 1024 });
+    }
+
+    [Fact]
+    public void R4_SQ08_ConcurrencyLimiter_BoundsParserThreads()
+    {
+        using var limiter = new SemaphoreSlim(0, 1);
+        var engine = new FastSqlEngine
+        {
+            ParseConcurrencyLimiter = limiter,
+            ParseTimeout = TimeSpan.FromMilliseconds(200)
+        };
+
+        var ex = Assert.ThrowsAny<ParseCanceledException>(() => engine.Parse("SELECT id FROM orders".AsMemory()));
+        Assert.IsType<TimeoutException>(ex.InnerException);
+        Assert.Contains("concurrent parser slots", ex.Message);
+
+        limiter.Release();
+        Assert.NotNull(engine.Parse("SELECT id FROM orders".AsMemory()).Tree);
+
+        // The parser thread releases its slot before completion is signaled.
+        Assert.Equal(1, limiter.CurrentCount);
+    }
+
+    [Fact]
+    public void R4_SQ08_SyntaxErrorsFromParserThread_KeepTheirExceptionType()
+    {
+        Assert.ThrowsAny<ParseCanceledException>(() => _engine.Parse("SELECT * FROM WHERE".AsMemory()));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastSqlEngine { MaxQueryLength = 10 }.Parse("SELECT id FROM orders".AsMemory()));
+    }
+
+    // ---------------------------------------------------------------- SQ-06 / P-02
+
+    [Theory]
+    [InlineData("ts_stat")]
+    [InlineData("setval")]
+    [InlineData("nextval")]
+    [InlineData("pg_logical_slot_get_changes")]
+    [InlineData("has_table_privilege")]
+    [InlineData("has_foo_privilege")]
+    [InlineData("to_regclass")]
+    [InlineData("inet_client_addr")]
+    [InlineData("current_database")]
+    [InlineData("version")]
+    [InlineData("SESSION_CONTEXT")]
+    [InlineData("CONTEXT_INFO")]
+    [InlineData("OBJECT_DEFINITION")]
+    [InlineData("ORIGINAL_LOGIN")]
+    [InlineData("HOST_NAME")]
+    [InlineData("load_extension")]
+    [InlineData("readfile")]
+    [InlineData("writefile")]
+    [InlineData("zeroblob")]
+    [InlineData("randomblob")]
+    public void R4_P02_SensitiveFunctions_AreOnDenylist(string functionName)
+    {
+        Assert.True(SqlFunctionPolicy.IsDeniedByDefault(functionName));
+        Assert.Throws<SecurityException>(() =>
+            _engine.RewriteRls($"SELECT {functionName}('x'), id FROM orders".AsMemory()));
+    }
+
+    [Fact]
+    public void R4_SQ06_DialectAllowlists_ContainCommonFunctions_AndNoDeniedFunction()
+    {
+        foreach (TargetSqlDialect dialect in Enum.GetValues<TargetSqlDialect>())
+        {
+            var allowlist = SqlFunctionAllowlists.GetDefault(dialect);
+            foreach (var name in new[] { "count", "sum", "avg", "min", "max", "lower", "upper", "coalesce", "nullif", "row_number", "rank", "lag", "lead", "abs", "round" })
+            {
+                Assert.Contains(name, allowlist);
+            }
+
+            foreach (var name in allowlist)
+            {
+                Assert.False(SqlFunctionPolicy.IsDeniedByDefault(name), $"{dialect}: {name} is denylisted");
+            }
+        }
+
+        Assert.Contains("date_trunc", SqlFunctionAllowlists.PostgreSql);
+        Assert.Contains("string_agg", SqlFunctionAllowlists.PostgreSql);
+        Assert.Contains("dateadd", SqlFunctionAllowlists.SqlServer);
+        Assert.Contains("datediff", SqlFunctionAllowlists.SqlServer);
+        Assert.Contains("strftime", SqlFunctionAllowlists.Sqlite);
+        Assert.DoesNotContain("load_extension", SqlFunctionAllowlists.Sqlite);
+        Assert.DoesNotContain("session_context", SqlFunctionAllowlists.SqlServer);
+    }
+
+    [Fact]
+    public void R4_SQ06_AnalyticsQuery_WithPostgreSqlAllowlist_Works()
+    {
+        var options = new RlsOptions { AllowedFunctions = SqlFunctionAllowlists.PostgreSql, TargetDialect = TargetSqlDialect.PostgreSql };
+        string sql = "SELECT region, count(*), sum(amount), round(avg(amount), 2), date_trunc('month', created_at), " +
+                     "coalesce(max(note), 'n/a'), row_number() OVER (ORDER BY region) FROM orders GROUP BY region, created_at";
+
+        string secured = _engine.RewriteRls(sql.AsMemory(), options);
+
+        Assert.Contains("(SELECT * FROM orders WHERE tenant_id = 42)", secured);
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls("SELECT md5(note) FROM orders".AsMemory(), options));
+    }
+
+    [Fact]
+    public void R4_SQ06_DenylistBeatsAllowlist()
+    {
+        var options = new RlsOptions
+        {
+            AllowedFunctions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "ts_stat", "load_extension", "upper" }
+        };
+
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls("SELECT ts_stat('SELECT 1'), id FROM orders".AsMemory(), options));
+        Assert.Throws<SecurityException>(() => _engine.RewriteRls("SELECT load_extension('x'), id FROM orders".AsMemory(), options));
+        _engine.RewriteRls("SELECT upper(name) FROM orders".AsMemory(), options);
+
+        var built = SqlFunctionAllowlists.Build(TargetSqlDialect.PostgreSql, new[] { "md5", " TS_STAT ", "setval", "" });
+        Assert.Contains("md5", built);
+        Assert.DoesNotContain("ts_stat", built);
+        Assert.DoesNotContain("setval", built);
     }
 }

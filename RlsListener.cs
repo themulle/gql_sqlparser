@@ -190,6 +190,31 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
     }
 
+    // SEC P-01: Method call syntax (expr.method(...), Type::method(...)) bypasses the function policy (e.g. SQL Server
+    // XML/CLR methods such as .value()/.query()/.nodes()) and is rejected unconditionally, unless it represents a
+    // schema-qualified function call (e.g. util.normalize(name)), in which case it is evaluated against the function policy.
+    public override void EnterMethodCall(SqlBaseParser.MethodCallContext context)
+    {
+        if (context.primaryExpression() is SqlBaseParser.ColumnReferenceContext colRef)
+        {
+            var prefix = SqlIdentifierHelper.NormalizeIdentifier(colRef.GetText());
+            var method = SqlIdentifierHelper.NormalizeIdentifier(context.methodName().GetText());
+            var name = $"{prefix}.{method}";
+            if (_options.EnforceFunctionPolicy && !SqlFunctionPolicy.IsFunctionAllowed(name, _options))
+            {
+                throw new SecurityException($"Function '{name}' is not permitted by the SQL function policy.");
+            }
+            return;
+        }
+
+        throw new SecurityException("Method call syntax (expression.method(...)) is not permitted.");
+    }
+
+    public override void EnterStaticMethodCall(SqlBaseParser.StaticMethodCallContext context)
+    {
+        throw new SecurityException("Static method call syntax (Type::method(...)) is not permitted.");
+    }
+
     // SEC-05: Lexical CTE Scoping
     public override void EnterQuery(SqlBaseParser.QueryContext context)
     {
