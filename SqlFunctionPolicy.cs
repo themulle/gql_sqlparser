@@ -147,9 +147,5 @@ public static class SqlFunctionPolicy
         return false;
     }
 
-    private static string GetSimpleName(string fullName)
-    {
-        int lastDot = fullName.LastIndexOf('.');
-        return lastDot >= 0 && lastDot < fullName.Length - 1 ? fullName[(lastDot + 1)..] : fullName;
-    }
+    private static string GetSimpleName(string fullName) => SqlIdentifierHelper.GetSimpleName(fullName);
 }

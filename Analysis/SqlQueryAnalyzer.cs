@@ -131,18 +131,9 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         }
     }
 
-    // SEC P-01: Method call syntax bypasses the function policy and is rejected unconditionally,
-    // unless it is a simple schema-qualified function call (e.g. util.normalize(name)).
+    // SEC P-01: Method call syntax (expression.method(...)) is unconditionally rejected.
     public override void EnterMethodCall(SqlBaseParser.MethodCallContext context)
     {
-        if (context.primaryExpression() is SqlBaseParser.ColumnReferenceContext colRef)
-        {
-            var prefix = SqlIdentifierHelper.NormalizeIdentifier(colRef.GetText()).ToLowerInvariant();
-            var method = SqlIdentifierHelper.NormalizeIdentifier(context.methodName().GetText()).ToLowerInvariant();
-            _functionCalls.Add($"{prefix}.{method}");
-            return;
-        }
-
         throw new SecurityException("Method call syntax (expression.method(...)) is not permitted.");
     }
 

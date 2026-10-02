@@ -8,109 +8,19 @@ using Antlr4.Runtime;
 using Antlr4.Runtime.Misc;
 using Antlr4.Runtime.Tree;
 
-public static class SqlIdentifierHelper
-{
-    public static string NormalizeIdentifier(string id)
-    {
-        if (string.IsNullOrWhiteSpace(id)) return string.Empty;
-        id = id.Trim();
-        if (id.Length >= 2)
-        {
-            if ((id[0] == '"' && id[^1] == '"') ||
-                (id[0] == '`' && id[^1] == '`') ||
-                (id[0] == '[' && id[^1] == ']'))
-            {
-                return id[1..^1];
-            }
-        }
-        return id;
-    }
-
-    /// <summary>
-    /// SEC C-02: Scope key for single-part identifiers (CTE names). Unquoted identifiers are case-folded to lower case,
-    /// quoted identifiers keep their exact content (doubled quote characters are unescaped). Comparing keys ordinally
-    /// is therefore conservative for both case-insensitive (Trino) and case-sensitive quoted (PostgreSQL) semantics:
-    /// when in doubt a reference is treated as a physical table (and secured), never as a CTE.
-    /// </summary>
-    public static string FoldIdentifierForScope(string rawIdentifier)
-    {
-        if (string.IsNullOrWhiteSpace(rawIdentifier)) return string.Empty;
-        string id = rawIdentifier.Trim();
-        if (id.Length >= 2)
-        {
-            char first = id[0];
-            char last = id[^1];
-            if (first == '"' && last == '"') return id[1..^1].Replace("\"\"", "\"", StringComparison.Ordinal);
-            if (first == '`' && last == '`') return id[1..^1].Replace("``", "`", StringComparison.Ordinal);
-            if (first == '[' && last == ']') return id[1..^1];
-        }
-        return id.ToLowerInvariant();
-    }
-
-    /// <summary>
-    /// SEC M-24: Quotes a catalog-provided column name as a delimited SQL identifier ("..." with doubled quotes).
-    /// </summary>
-    public static string QuoteIdentifier(string name)
-    {
-        ArgumentNullException.ThrowIfNull(name);
-        return "\"" + name.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
-    }
-
-    /// <summary>
-    /// SEC M-23: Removes exactly one pair of enclosing single quotes and unescapes doubled quotes ('' -> ').
-    /// Values without enclosing single quotes are returned trimmed but otherwise unchanged.
-    /// </summary>
-    public static string UnquoteStringLiteral(string value)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-        string v = value.Trim();
-        if (v.Length >= 2 && v[0] == '\'' && v[^1] == '\'')
-        {
-            return v[1..^1].Replace("''", "'", StringComparison.Ordinal);
-        }
-        return v;
-    }
-
-    public static string NormalizeQualifiedName(SqlBaseParser.QualifiedNameContext context)
-    {
-        var ids = context.identifier();
-        if (ids == null || ids.Length == 0) return NormalizeIdentifier(context.GetText());
-        var parts = new string[ids.Length];
-        for (int i = 0; i < ids.Length; i++)
-        {
-            parts[i] = NormalizeIdentifier(ids[i].GetText());
-        }
-        return string.Join(".", parts);
-    }
-}
-
 public sealed class RlsListener : SqlBaseBaseListener
 {
     private readonly TokenStreamRewriter _rewriter;
     private readonly RlsOptions _options;
-    private readonly ITokenStream _tokens;
     private readonly Stack<HashSet<string>> _cteScopeStack = new();
     private bool _rootLimitHandled = false;
 
     public RlsListener(ITokenStream tokens, RlsOptions? options = null)
     {
-        _tokens = tokens ?? throw new ArgumentNullException(nameof(tokens));
+        ArgumentNullException.ThrowIfNull(tokens);
         _rewriter = new TokenStreamRewriter(tokens);
         _options = options ?? new RlsOptions();
         _cteScopeStack.Push(new HashSet<string>(StringComparer.Ordinal));
-
-        // SQ-02: Strict rejection of comments when configured
-        if (_options.RejectComments)
-        {
-            for (int i = 0; i < tokens.Size; i++)
-            {
-                var tok = tokens.Get(i);
-                if (tok.Type == SqlBaseLexer.SIMPLE_COMMENT || tok.Type == SqlBaseLexer.BRACKETED_COMMENT)
-                {
-                    throw new ParseCanceledException($"line {tok.Line}:{tok.Column}: SQL comments are not permitted in governed execution.");
-                }
-            }
-        }
     }
 
     // SEC-01: Statement validation based on EnforceReadOnlyQueries
@@ -190,23 +100,9 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
     }
 
-    // SEC P-01: Method call syntax (expr.method(...), Type::method(...)) bypasses the function policy (e.g. SQL Server
-    // XML/CLR methods such as .value()/.query()/.nodes()) and is rejected unconditionally, unless it represents a
-    // schema-qualified function call (e.g. util.normalize(name)), in which case it is evaluated against the function policy.
+    // SEC P-01: Method call syntax (expression.method(...)) is not permitted.
     public override void EnterMethodCall(SqlBaseParser.MethodCallContext context)
     {
-        if (context.primaryExpression() is SqlBaseParser.ColumnReferenceContext colRef)
-        {
-            var prefix = SqlIdentifierHelper.NormalizeIdentifier(colRef.GetText());
-            var method = SqlIdentifierHelper.NormalizeIdentifier(context.methodName().GetText());
-            var name = $"{prefix}.{method}";
-            if (_options.EnforceFunctionPolicy && !SqlFunctionPolicy.IsFunctionAllowed(name, _options))
-            {
-                throw new SecurityException($"Function '{name}' is not permitted by the SQL function policy.");
-            }
-            return;
-        }
-
         throw new SecurityException("Method call syntax (expression.method(...)) is not permitted.");
     }
 
@@ -268,13 +164,10 @@ public sealed class RlsListener : SqlBaseBaseListener
             {
                 effectiveVal = existingVal;
             }
-            string limitVal = effectiveVal.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
             if (_options.TargetDialect == TargetSqlDialect.SqlServer)
             {
-                string tsqlLimit = context.orderBy() != null
-                    ? $"OFFSET 0 ROWS FETCH NEXT {limitVal} ROWS ONLY"
-                    : $"ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT {limitVal} ROWS ONLY";
+                string tsqlLimit = FastSqlEngine.BuildTsqlLimitClause(effectiveVal, context.offset != null, context.orderBy() != null);
                 _rewriter.Replace(context.LIMIT().Symbol, context.limit.Stop, tsqlLimit);
             }
             else
@@ -295,18 +188,31 @@ public sealed class RlsListener : SqlBaseBaseListener
         else if (context.FETCH() != null)
         {
             _rootLimitHandled = true;
-            if (context.fetchFirst != null)
+            if (_options.TargetDialect == TargetSqlDialect.SqlServer)
             {
-                if (!long.TryParse(context.fetchFirst.GetText(), out long existingVal) || existingVal > _options.EnforcedMaxRows)
+                long effectiveVal = _options.EnforcedMaxRows;
+                if (context.fetchFirst != null && long.TryParse(context.fetchFirst.GetText(), out long existingVal) && existingVal < effectiveVal)
                 {
-                    _rewriter.Replace(context.fetchFirst.Start, context.fetchFirst.Stop, maxRows);
+                    effectiveVal = existingVal;
                 }
+                string tsqlLimit = FastSqlEngine.BuildTsqlLimitClause(effectiveVal, context.offset != null, context.orderBy() != null);
+                _rewriter.Replace(context.FETCH().Symbol, context.Stop, tsqlLimit);
             }
-
-            // WITH TIES may return more rows than requested; downgrade to ONLY.
-            if (context.TIES() != null && context.WITH() != null)
+            else
             {
-                _rewriter.Replace(context.WITH().Symbol, context.TIES().Symbol, "ONLY");
+                if (context.fetchFirst != null)
+                {
+                    if (!long.TryParse(context.fetchFirst.GetText(), out long existingVal) || existingVal > _options.EnforcedMaxRows)
+                    {
+                        _rewriter.Replace(context.fetchFirst.Start, context.fetchFirst.Stop, maxRows);
+                    }
+                }
+
+                // WITH TIES may return more rows than requested; downgrade to ONLY.
+                if (context.TIES() != null && context.WITH() != null)
+                {
+                    _rewriter.Replace(context.WITH().Symbol, context.TIES().Symbol, "ONLY");
+                }
             }
         }
     }
@@ -318,14 +224,8 @@ public sealed class RlsListener : SqlBaseBaseListener
             _rootLimitHandled = true;
             if (_options.TargetDialect == TargetSqlDialect.SqlServer)
             {
-                if (context.orderBy() != null)
-                {
-                    _rewriter.InsertAfter(context.Stop, $" OFFSET 0 ROWS FETCH NEXT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)} ROWS ONLY");
-                }
-                else
-                {
-                    _rewriter.InsertAfter(context.Stop, $" ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)} ROWS ONLY");
-                }
+                string tsqlClause = FastSqlEngine.BuildTsqlLimitClause(_options.EnforcedMaxRows, context.offset != null, context.orderBy() != null);
+                _rewriter.InsertAfter(context.Stop, $" {tsqlClause}");
             }
             else
             {
@@ -334,13 +234,12 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
     }
 
-    // Standard SELECT relation: FROM orders (relationPrimary: qualifiedName -> #tableName)
-    public override void EnterTableName(SqlBaseParser.TableNameContext context)
+    private void SecureRelation(SqlBaseParser.QualifiedNameContext qualifiedName, ParserRuleContext replaceScope)
     {
-        string rawName = context.qualifiedName().GetText();
-        string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
+        string rawName = qualifiedName.GetText();
+        string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(qualifiedName);
 
-        if (IsCte(context.qualifiedName()))
+        if (IsCte(qualifiedName))
             return;
 
         bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
@@ -349,46 +248,26 @@ public sealed class RlsListener : SqlBaseBaseListener
         if (!shouldApplyRls && !hasMasking)
             return;
 
-        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
-        _rewriter.Replace(context.Start, context.Stop, replacement);
+        string replacement = BuildReplacement(replaceScope, rawName, normalizedName, shouldApplyRls);
+        _rewriter.Replace(replaceScope.Start, replaceScope.Stop, replacement);
+    }
+
+    // Standard SELECT relation: FROM orders (relationPrimary: qualifiedName -> #tableName)
+    public override void EnterTableName(SqlBaseParser.TableNameContext context)
+    {
+        SecureRelation(context.qualifiedName(), context);
     }
 
     // Trino/SQL 'TABLE orders' Syntax (queryPrimary -> #table)
     public override void EnterTable(SqlBaseParser.TableContext context)
     {
-        string rawName = context.qualifiedName().GetText();
-        string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
-
-        if (IsCte(context.qualifiedName()))
-            return;
-
-        bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
-        bool hasMasking = HasMaskingForTable(normalizedName);
-
-        if (!shouldApplyRls && !hasMasking)
-            return;
-
-        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
-        _rewriter.Replace(context.Start, context.Stop, replacement);
+        SecureRelation(context.qualifiedName(), context);
     }
 
     // Trino Polymorphic Table Functions: TABLE(orders) argument (tableArgumentRelation -> #tableArgumentTable)
     public override void EnterTableArgumentTable(SqlBaseParser.TableArgumentTableContext context)
     {
-        string rawName = context.qualifiedName().GetText();
-        string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
-
-        if (IsCte(context.qualifiedName()))
-            return;
-
-        bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
-        bool hasMasking = HasMaskingForTable(normalizedName);
-
-        if (!shouldApplyRls && !hasMasking)
-            return;
-
-        string replacement = BuildReplacement(context, rawName, normalizedName, shouldApplyRls);
-        _rewriter.Replace(context.qualifiedName().Start, context.qualifiedName().Stop, replacement);
+        SecureRelation(context.qualifiedName(), context.qualifiedName());
     }
 
     // DML: DELETE FROM <table> [WHERE <predicate>]
@@ -446,8 +325,6 @@ public sealed class RlsListener : SqlBaseBaseListener
         // 1. WITH CHECK OPTION verification on assignments
         if (_options.EnforceWithCheckOption && assignments != null)
         {
-            string expectedTenant = SqlIdentifierHelper.UnquoteStringLiteral(_options.ExpectedTenantValue);
-
             foreach (var assignment in assignments)
             {
                 string colName = SqlIdentifierHelper.NormalizeIdentifier(assignment.identifier().GetText());
@@ -458,6 +335,12 @@ public sealed class RlsListener : SqlBaseBaseListener
                         throw new SecurityException($"Modification of tenant column '{colName}' is not allowed in UPDATE statement.");
                     }
 
+                    if (string.IsNullOrEmpty(_options.ExpectedTenantValue))
+                    {
+                        throw new SecurityException("Expected tenant value must be configured when WITH CHECK OPTION is active.");
+                    }
+
+                    string expectedTenant = SqlIdentifierHelper.UnquoteStringLiteral(_options.ExpectedTenantValue);
                     EnsureTenantLiteral(assignment.expression(), expectedTenant, "UPDATE");
                 }
             }
@@ -484,12 +367,7 @@ public sealed class RlsListener : SqlBaseBaseListener
     public override void EnterInsertInto(SqlBaseParser.InsertIntoContext context)
     {
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
-        string simpleTableName = normalizedName;
-        int lastDot = simpleTableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
-        {
-            simpleTableName = simpleTableName.Substring(lastDot + 1);
-        }
+        string simpleTableName = SqlIdentifierHelper.GetSimpleName(normalizedName);
 
         // SQ-07: Reject INSERT on tables that have custom row-level consent filters beyond simple tenant partition
         if (_options.RejectConsentFilteredInsert && _options.TablesWithConsentRowFilter.Count > 0)
@@ -537,6 +415,10 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
 
         // SEC M-23: verify every VALUES row and every branch of set operations; non-literals are rejected.
+        if (string.IsNullOrEmpty(_options.ExpectedTenantValue))
+        {
+            throw new SecurityException("Expected tenant value must be configured when WITH CHECK OPTION is active.");
+        }
         string expectedTenant = SqlIdentifierHelper.UnquoteStringLiteral(_options.ExpectedTenantValue);
         VerifyInsertQueryTerm(queryNoWith.queryTerm(), tenantIndex, expectedTenant);
     }
@@ -913,12 +795,7 @@ public sealed class RlsListener : SqlBaseBaseListener
         if (!_options.RejectMaskedColumnsInDml || _options.ColumnMaskingProvider == null)
             return;
 
-        string simpleTableName = normalizedTableName;
-        int lastDot = simpleTableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
-        {
-            simpleTableName = simpleTableName.Substring(lastDot + 1);
-        }
+        string simpleTableName = SqlIdentifierHelper.GetSimpleName(normalizedTableName);
 
         var stack = new Stack<IParseTree>();
         stack.Push(scope);
@@ -989,12 +866,7 @@ public sealed class RlsListener : SqlBaseBaseListener
         if (_options.ColumnMaskingProvider == null)
             return false;
 
-        string simpleTableName = normalizedTableName;
-        int lastDot = simpleTableName.LastIndexOf('.');
-        if (lastDot >= 0 && lastDot < simpleTableName.Length - 1)
-        {
-            simpleTableName = simpleTableName.Substring(lastDot + 1);
-        }
+        string simpleTableName = SqlIdentifierHelper.GetSimpleName(normalizedTableName);
 
         if (_options.TablesWithMaskedColumns.Contains(normalizedTableName) ||
             _options.TablesWithMaskedColumns.Contains(simpleTableName))
@@ -1069,18 +941,22 @@ public sealed class RlsListener : SqlBaseBaseListener
             if (!hasExplicitAlias)
             {
                 // SQ-05: Table aliases cannot be dot-qualified (e.g. AS schema.table is invalid across DBs).
-                // Use the unqualified simple table name as alias.
-                string alias = rawTableName;
-                int dotIdx = alias.LastIndexOf('.');
-                if (dotIdx >= 0 && dotIdx < alias.Length - 1)
-                {
-                    alias = alias.Substring(dotIdx + 1);
-                }
+                // Use dialect-compliant unqualified table alias.
+                string alias = FastSqlEngine.FormatTableAlias(normalizedTableName, _options.TargetDialect);
                 return $"{subquery} AS {alias}";
             }
         }
 
         return subquery;
+    }
+
+    // SQ-13: Reject time-travel queries (FOR TIMESTAMP/VERSION AS OF)
+    public override void EnterQueryPeriod(SqlBaseParser.QueryPeriodContext context)
+    {
+        if (_options.RejectTimeTravelQueries)
+        {
+            throw new SecurityException("Time-travel queries (FOR TIMESTAMP/VERSION AS OF) are not permitted.");
+        }
     }
 
     public string GetSecuredSql() => _rewriter.GetText();

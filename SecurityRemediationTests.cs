@@ -578,8 +578,8 @@ public class SecurityRemediationTests
             AllowedFunctions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "util.normalize", "upper" }
         };
 
-        string secured = _engine.RewriteRls("SELECT util.normalize(name), upper(name) FROM orders".AsMemory(), options);
-        var meta = _engine.Analyze("SELECT util.normalize(name), upper(name) FROM orders".AsMemory());
+        string secured = _engine.RewriteRls("SELECT util.\"normalize\"(name), upper(name) FROM orders".AsMemory(), options);
+        var meta = _engine.Analyze("SELECT util.\"normalize\"(name), upper(name) FROM orders".AsMemory());
 
         Assert.Contains("(SELECT * FROM orders WHERE tenant_id = 42)", secured);
         Assert.Contains("util.normalize", meta.FunctionCalls!);

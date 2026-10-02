@@ -38,12 +38,8 @@ public sealed class DefaultRlsPolicyProvider : IRlsPolicyProvider
 
         if (FallbackToSimpleName)
         {
-            int lastDot = tableName.LastIndexOf('.');
-            if (lastDot >= 0 && lastDot < tableName.Length - 1)
-            {
-                string simpleName = tableName.Substring(lastDot + 1);
-                if (_predicate(simpleName)) return true;
-            }
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _predicate(simpleName)) return true;
         }
 
         return false;
@@ -87,12 +83,8 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
 
         if (FallbackToSimpleName)
         {
-            int lastDot = tableName.LastIndexOf('.');
-            if (lastDot >= 0 && lastDot < tableName.Length - 1)
-            {
-                string simpleName = tableName[(lastDot + 1)..];
-                if (_hasMaskPredicate(simpleName, columnName)) return true;
-            }
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _hasMaskPredicate(simpleName, columnName)) return true;
         }
 
         return false;
@@ -102,14 +94,10 @@ public sealed class DefaultColumnMaskingPolicyProvider : IColumnMaskingPolicyPro
     {
         if (FallbackToSimpleName)
         {
-            int lastDot = tableName.LastIndexOf('.');
-            if (lastDot >= 0 && lastDot < tableName.Length - 1)
+            string simpleName = SqlIdentifierHelper.GetSimpleName(tableName);
+            if (!string.Equals(simpleName, tableName, StringComparison.Ordinal) && _hasMaskPredicate(simpleName, columnName))
             {
-                string simpleName = tableName[(lastDot + 1)..];
-                if (_hasMaskPredicate(simpleName, columnName))
-                {
-                    return _maskExpressionProvider(simpleName, columnName);
-                }
+                return _maskExpressionProvider(simpleName, columnName);
             }
         }
 
@@ -162,9 +150,9 @@ public sealed class RlsOptions
     public string TenantColumnName { get; set; } = "tenant_id";
 
     /// <summary>
-    /// Expected tenant value for WITH CHECK OPTION verification. Default is "42".
+    /// Expected tenant value for WITH CHECK OPTION verification. Null by default (must be explicitly set when WITH CHECK OPTION is active).
     /// </summary>
-    public string ExpectedTenantValue { get; set; } = "42";
+    public string? ExpectedTenantValue { get; set; } = null;
 
     /// <summary>
     /// If true, strictly forbids setting the tenant column in an UPDATE statement regardless of the assigned value.

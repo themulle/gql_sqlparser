@@ -37,6 +37,18 @@ public sealed record SqlTokenSecurityOptions
     /// <summary>All switches off (pure syntax parsing, e.g. Trino compliance fixtures).</summary>
     public static SqlTokenSecurityOptions None { get; } = new();
 
+    /// <summary>Strict preset with all token security switches enabled.</summary>
+    public static SqlTokenSecurityOptions Strict { get; } = new()
+    {
+        RejectComments = true,
+        RejectBackslashInStrings = true,
+        RejectEscapedStringLiterals = true,
+        RejectDollarQuoting = true,
+        RejectNonAsciiIdentifiers = true,
+        RejectDotsInQuotedIdentifiers = true,
+        RejectTimeTravelQueries = true
+    };
+
     /// <summary>SQ-02: Reject comments.</summary>
     public bool RejectComments { get; init; }
 
@@ -130,7 +142,7 @@ internal sealed class CancellableTokenStream : CommonTokenStream
     }
 }
 
-public sealed class FastSqlEngine
+public sealed partial class FastSqlEngine
 {
     /// <summary>SQ-08: Default stack size of the dedicated parser thread (16 MB).</summary>
     public const int DefaultParseThreadStackSize = 16 * 1024 * 1024;
@@ -177,7 +189,7 @@ public sealed class FastSqlEngine
     public TimeSpan ParseTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// SQ-08: Stack size (bytes) of the dedicated parser thread. Default 16 MB; minimum 256 KB.
+    /// SQ-08: Stack size (bytes) of the dedicated parser thread. Default 4 MB; minimum 256 KB.
     /// </summary>
     public int ParseThreadStackSize
     {
@@ -522,24 +534,36 @@ public sealed class FastSqlEngine
                     $"line {token.Line}:{token.Column}: Dollar-quoted strings ($$...$$) are not permitted.");
             }
 
-            // SQ-10: Non-ASCII in unquoted identifier
-            if (options.RejectNonAsciiIdentifiers && type == SqlBaseLexer.IDENTIFIER && text != null)
+            // SQ-10: Non-ASCII characters outside strings/quoted identifiers
+            if (options.RejectNonAsciiIdentifiers && text != null &&
+                type != SqlBaseLexer.STRING &&
+                type != SqlBaseLexer.UNICODE_STRING &&
+                type != SqlBaseLexer.DOLLAR_STRING &&
+                type != SqlBaseLexer.QUOTED_IDENTIFIER &&
+                type != SqlBaseLexer.BACKQUOTED_IDENTIFIER)
             {
                 for (int ci = 0; ci < text.Length; ci++)
                 {
                     if (text[ci] > 127)
                     {
                         throw new ParseCanceledException(
-                            $"line {token.Line}:{token.Column}: Non-ASCII characters in unquoted identifier '{text}' are not permitted.");
+                            $"line {token.Line}:{token.Column}: Non-ASCII characters outside string literals ('{text}') are not permitted.");
                     }
                 }
             }
 
-            // SQ-11: Dots in quoted identifiers ("a.b")
-            if (options.RejectDotsInQuotedIdentifiers && (type == SqlBaseLexer.QUOTED_IDENTIFIER || type == SqlBaseLexer.BACKQUOTED_IDENTIFIER) && text != null && text.Contains('.'))
+            // SQ-11: Dots inside quoted identifiers ("a.b")
+            if (options.RejectDotsInQuotedIdentifiers && (type == SqlBaseLexer.QUOTED_IDENTIFIER || type == SqlBaseLexer.BACKQUOTED_IDENTIFIER) && text != null)
             {
-                throw new ParseCanceledException(
-                    $"line {token.Line}:{token.Column}: Dots inside quoted identifiers ({text}) are not permitted.");
+                for (int ci = 0; ci < text.Length; ci++)
+                {
+                    char c = text[ci];
+                    if (c == '.' || char.IsControl(c))
+                    {
+                        throw new ParseCanceledException(
+                            $"line {token.Line}:{token.Column}: Dots inside quoted identifiers ({text}) are not permitted.");
+                    }
+                }
             }
 
             // SQ-13: Time-travel queries (FOR TIMESTAMP/VERSION AS OF)
