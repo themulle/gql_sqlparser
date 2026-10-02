@@ -273,7 +273,8 @@ public class TrinoParserComplianceTests
     public void Rls_DeleteWithoutWhere_AppendsFilter()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "DELETE FROM orders";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 
@@ -284,7 +285,8 @@ public class TrinoParserComplianceTests
     public void Rls_DeleteWithWhere_InjectsAndWrapsInParentheses()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "DELETE FROM orders WHERE id = 10 OR 1=1";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 
@@ -296,7 +298,8 @@ public class TrinoParserComplianceTests
     public void Rls_UpdateWithoutWhere_AppendsFilter()
     {
         var engine = new FastSqlEngine();
-        var options = new RlsOptions { EnforceReadOnlyQueries = false };
+        // Tests the RLS WHERE injection mechanics; the unfiltered-DML guardrail is covered by DML_* tests.
+        var options = new RlsOptions { EnforceReadOnlyQueries = false, RejectUnfilteredDml = false };
         string sql = "UPDATE orders SET status = 'shipped'";
         string secured = engine.RewriteRls(sql.AsMemory(), options);
 

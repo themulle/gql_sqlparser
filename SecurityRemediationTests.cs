@@ -474,4 +474,70 @@ public class SecurityRemediationTests
 
         Assert.Empty(unexpected);
     }
+
+    // ---------------------------------------------------------------- DML guardrails (RejectUnfilteredDml)
+
+    [Fact]
+    public void DML_RejectUnfilteredDml_IsEnabledByDefault()
+    {
+        Assert.True(new RlsOptions().RejectUnfilteredDml);
+    }
+
+    [Theory]
+    [InlineData("DELETE FROM orders")]
+    [InlineData("UPDATE orders SET status = 'shipped'")]
+    public void DML_UpdateOrDeleteWithoutWhere_IsRejected(string sql)
+    {
+        // The RLS rewrite would append its own WHERE (tenant filter); the guardrail checks the original statement.
+        Assert.Throws<UnfilteredDmlException>(() => _engine.RewriteRls(sql.AsMemory(), DmlOptions()));
+    }
+
+    [Theory]
+    [InlineData("DELETE FROM orders WHERE 1=1")]
+    [InlineData("DELETE FROM orders WHERE 1 = 1.0")]
+    [InlineData("DELETE FROM orders WHERE true")]
+    [InlineData("DELETE FROM orders WHERE (1=1)")]
+    [InlineData("DELETE FROM orders WHERE id = 10 OR 1=1")]
+    [InlineData("DELETE FROM orders WHERE 1=1 AND true")]
+    [InlineData("DELETE FROM orders WHERE NOT false")]
+    [InlineData("DELETE FROM orders WHERE 1 <> 2")]
+    [InlineData("DELETE FROM orders WHERE id = id")]
+    [InlineData("UPDATE orders SET status = 'shipped' WHERE 'a' = 'a'")]
+    [InlineData("UPDATE orders SET status = 'shipped' WHERE 1 = 1")]
+    public void DML_TriviallyTrueWhere_IsRejected(string sql)
+    {
+        Assert.Throws<UnfilteredDmlException>(() => _engine.RewriteRls(sql.AsMemory(), DmlOptions()));
+    }
+
+    [Fact]
+    public void DML_DeleteWithRealWhere_IsAllowed_AndTenantFilterIsInjected()
+    {
+        string secured = _engine.RewriteRls("DELETE FROM orders WHERE id = 10".AsMemory(), DmlOptions());
+
+        Assert.Equal("DELETE FROM orders WHERE (tenant_id = 42) AND (id = 10)", secured);
+    }
+
+    [Theory]
+    [InlineData("UPDATE orders SET status = 'shipped' WHERE id = 10")]
+    [InlineData("UPDATE orders SET status = 'shipped' WHERE id = 10 AND 1 = 1")]
+    [InlineData("DELETE FROM orders WHERE id = 1 OR id = 2")]
+    [InlineData("DELETE FROM orders WHERE 1 = 0")]
+    [InlineData("DELETE FROM orders WHERE created_at < '2020-01-01'")]
+    public void DML_RestrictingWhere_IsAllowed(string sql)
+    {
+        string secured = _engine.RewriteRls(sql.AsMemory(), DmlOptions());
+
+        Assert.Contains("(tenant_id = 42) AND (", secured);
+    }
+
+    [Fact]
+    public void DML_GuardrailCanBeDisabledExplicitly()
+    {
+        var options = DmlOptions();
+        options.RejectUnfilteredDml = false;
+
+        string secured = _engine.RewriteRls("DELETE FROM orders".AsMemory(), options);
+
+        Assert.Equal("DELETE FROM orders WHERE (tenant_id = 42)", secured);
+    }
 }

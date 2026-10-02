@@ -195,4 +195,12 @@ public sealed class RlsOptions
     /// in SET or WHERE are rejected (prevents copy-out and row-count oracles on masked data).
     /// </summary>
     public bool RejectMaskedColumnsInDml { get; set; } = true;
+
+    /// <summary>
+    /// When true (default), UPDATE/DELETE statements without a WHERE clause, or with a trivially true WHERE clause
+    /// (e.g. <c>WHERE 1=1</c>, <c>WHERE true</c>, <c>WHERE id = 5 OR 'a' = 'a'</c>), are rejected with an
+    /// <see cref="UnfilteredDmlException"/>. The check runs on the original statement, independent of the WHERE
+    /// clause injected by the RLS rewrite.
+    /// </summary>
+    public bool RejectUnfilteredDml { get; set; } = true;
 }

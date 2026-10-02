@@ -330,6 +330,9 @@ public sealed class RlsListener : SqlBaseBaseListener
             EnsureNoMaskedColumnReferences(normalizedName, context.booleanExpression(), "DELETE WHERE");
         }
 
+        // DML guardrail: checked on the original statement (the parse tree is not affected by the RLS rewrite).
+        EnsureFilteredDml(context.booleanExpression(), "DELETE");
+
         if (IsCte(context.qualifiedName()) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
             return;
 
@@ -364,6 +367,9 @@ public sealed class RlsListener : SqlBaseBaseListener
         {
             EnsureNoMaskedColumnReferences(normalizedName, context.where, "UPDATE WHERE");
         }
+
+        // DML guardrail: checked on the original statement (the parse tree is not affected by the RLS rewrite).
+        EnsureFilteredDml(context.where, "UPDATE");
 
         // 1. WITH CHECK OPTION verification on assignments
         if (_options.EnforceWithCheckOption && assignments != null)
@@ -601,6 +607,212 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
 
         return new[] { rowExpr };
+    }
+
+    /// <summary>
+    /// DML guardrail (<see cref="RlsOptions.RejectUnfilteredDml"/>): UPDATE/DELETE must carry a WHERE clause that is not
+    /// trivially true. Only simple, syntactically obvious tautologies are detected (TRUE literal, comparison of equal
+    /// constants, a column compared with itself, NOT FALSE, constant IS NOT NULL, combined via AND/OR/parentheses).
+    /// </summary>
+    private void EnsureFilteredDml(SqlBaseParser.BooleanExpressionContext? where, string operation)
+    {
+        if (!_options.RejectUnfilteredDml)
+            return;
+
+        if (where == null)
+        {
+            throw new UnfilteredDmlException($"{operation} without a WHERE clause is not permitted.");
+        }
+
+        if (IsTriviallyTrue(where))
+        {
+            throw new UnfilteredDmlException($"{operation} with a trivially true WHERE clause is not permitted.");
+        }
+    }
+
+    private static bool IsTriviallyTrue(SqlBaseParser.BooleanExpressionContext? expr)
+    {
+        switch (expr)
+        {
+            case SqlBaseParser.OrContext orExpr:
+                {
+                    var parts = orExpr.booleanExpression();
+                    foreach (var part in parts)
+                    {
+                        if (IsTriviallyTrue(part))
+                            return true;
+                    }
+                    return false;
+                }
+            case SqlBaseParser.AndContext andExpr:
+                {
+                    var parts = andExpr.booleanExpression();
+                    if (parts.Length == 0)
+                        return false;
+                    foreach (var part in parts)
+                    {
+                        if (!IsTriviallyTrue(part))
+                            return false;
+                    }
+                    return true;
+                }
+            case SqlBaseParser.LogicalNotContext notExpr:
+                return IsBooleanConstant(notExpr.booleanExpression(), expected: false);
+            case SqlBaseParser.PredicatedContext predicated:
+                return IsTriviallyTruePredicated(predicated);
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsTriviallyTruePredicated(SqlBaseParser.PredicatedContext predicated)
+    {
+        var left = predicated.valueExpression();
+        var predicate = predicated.predicate();
+
+        if (predicate == null)
+        {
+            var nested = TryGetParenthesizedBoolean(left);
+            if (nested != null)
+                return IsTriviallyTrue(nested);
+
+            return TryGetConstant(left, out var kind, out var text) && kind == 'b' &&
+                   text.Equals("true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (predicate is SqlBaseParser.ComparisonContext comparison)
+        {
+            var op = comparison.comparisonOperator();
+            if (op == null || left == null || comparison.right == null)
+                return false;
+
+            bool isEqualityLike = op.EQ() != null || op.LTE() != null || op.GTE() != null;
+
+            if (TryGetConstant(left, out var leftKind, out var leftText) &&
+                TryGetConstant(comparison.right, out var rightKind, out var rightText))
+            {
+                bool equal = ConstantsEqual(leftKind, leftText, rightKind, rightText);
+                if (isEqualityLike)
+                    return equal;
+                if (op.NEQ() != null)
+                    return leftKind == rightKind && !equal;
+                return false;
+            }
+
+            // A column compared with itself (id = id) matches every non-NULL row.
+            if (isEqualityLike && IsSameColumnReference(left, comparison.right))
+                return true;
+
+            return false;
+        }
+
+        if (predicate is SqlBaseParser.NullPredicateContext nullPredicate)
+        {
+            return nullPredicate.NOT() != null &&
+                   TryGetConstant(left, out var nullKind, out _) && nullKind != 'z';
+        }
+
+        return false;
+    }
+
+    private static bool IsBooleanConstant(SqlBaseParser.BooleanExpressionContext? expr, bool expected)
+    {
+        if (expr is not SqlBaseParser.PredicatedContext predicated || predicated.predicate() != null)
+            return false;
+
+        var nested = TryGetParenthesizedBoolean(predicated.valueExpression());
+        if (nested != null)
+            return IsBooleanConstant(nested, expected);
+
+        return TryGetConstant(predicated.valueExpression(), out var kind, out var text) && kind == 'b' &&
+               text.Equals(expected ? "true" : "false", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static SqlBaseParser.BooleanExpressionContext? TryGetParenthesizedBoolean(SqlBaseParser.ValueExpressionContext? value)
+    {
+        if (value is SqlBaseParser.ValueExpressionDefaultContext valueDefault &&
+            valueDefault.primaryExpression() is SqlBaseParser.ParenthesizedExpressionContext parenthesized)
+        {
+            return parenthesized.expression()?.booleanExpression();
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns a literal constant: kind 'n' (numeric), 's' (string), 'b' (boolean) or 'z' (NULL). Parentheses are unwrapped.
+    /// </summary>
+    private static bool TryGetConstant(SqlBaseParser.ValueExpressionContext? value, out char kind, out string text)
+    {
+        kind = '\0';
+        text = string.Empty;
+
+        if (value is not SqlBaseParser.ValueExpressionDefaultContext valueDefault)
+            return false;
+
+        var primary = valueDefault.primaryExpression();
+        if (primary is SqlBaseParser.ParenthesizedExpressionContext parenthesized)
+        {
+            if (parenthesized.expression()?.booleanExpression() is SqlBaseParser.PredicatedContext inner && inner.predicate() == null)
+                return TryGetConstant(inner.valueExpression(), out kind, out text);
+            return false;
+        }
+
+        if (primary is not SqlBaseParser.LiteralsContext literals)
+            return false;
+
+        switch (literals.literal())
+        {
+            case SqlBaseParser.NumericLiteralContext numeric:
+                kind = 'n';
+                text = numeric.GetText();
+                return true;
+            case SqlBaseParser.StringLiteralContext str:
+                kind = 's';
+                text = str.GetText();
+                return true;
+            case SqlBaseParser.BooleanLiteralContext boolean:
+                kind = 'b';
+                text = boolean.GetText();
+                return true;
+            case SqlBaseParser.NullLiteralContext:
+                kind = 'z';
+                text = "NULL";
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool ConstantsEqual(char leftKind, string leftText, char rightKind, string rightText)
+    {
+        if (leftKind != rightKind || leftKind == 'z')
+            return false;
+
+        if (leftKind == 'n' &&
+            decimal.TryParse(leftText, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var leftNumber) &&
+            decimal.TryParse(rightText, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rightNumber))
+        {
+            return leftNumber == rightNumber;
+        }
+
+        return leftKind == 'b'
+            ? leftText.Equals(rightText, StringComparison.OrdinalIgnoreCase)
+            : leftText.Equals(rightText, StringComparison.Ordinal);
+    }
+
+    private static bool IsSameColumnReference(SqlBaseParser.ValueExpressionContext left, SqlBaseParser.ValueExpressionContext right)
+    {
+        if (left is not SqlBaseParser.ValueExpressionDefaultContext leftDefault ||
+            right is not SqlBaseParser.ValueExpressionDefaultContext rightDefault)
+            return false;
+
+        var leftPrimary = leftDefault.primaryExpression();
+        var rightPrimary = rightDefault.primaryExpression();
+        bool leftIsColumn = leftPrimary is SqlBaseParser.ColumnReferenceContext or SqlBaseParser.DereferenceContext;
+        bool rightIsColumn = rightPrimary is SqlBaseParser.ColumnReferenceContext or SqlBaseParser.DereferenceContext;
+
+        return leftIsColumn && rightIsColumn &&
+               leftPrimary.GetText().Equals(rightPrimary.GetText(), StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
