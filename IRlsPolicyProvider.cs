@@ -153,7 +153,46 @@ public sealed class RlsOptions
 
     /// <summary>
     /// When true and EnforceWithCheckOption is true, requires INSERT statements to explicitly specify the tenant column.
-    /// Default is false to allow databases with DEFAULT tenant expressions.
+    /// SEC M-23: Default is true (secure default). Set to false only for databases that enforce the tenant via DEFAULT/trigger.
     /// </summary>
-    public bool RequireTenantColumnInInsert { get; set; } = false;
+    public bool RequireTenantColumnInInsert { get; set; } = true;
+
+    /// <summary>
+    /// SEC C-01: When true (default), every function call in the statement is checked against the function policy
+    /// (<see cref="SqlFunctionPolicy"/>). Violations raise a <see cref="System.Security.SecurityException"/>.
+    /// </summary>
+    public bool EnforceFunctionPolicy { get; set; } = true;
+
+    /// <summary>
+    /// SEC C-01: Optional exclusive allowlist of (qualified, case-insensitive) function names.
+    /// When set, only these functions are permitted and the default denylist is not consulted.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedFunctions { get; set; }
+
+    /// <summary>
+    /// SEC C-01: Additional function names that are always rejected (also in allowlist mode).
+    /// </summary>
+    public IReadOnlySet<string>? AdditionalDeniedFunctions { get; set; }
+
+    /// <summary>
+    /// SEC H-14: Allowlist of (qualified, case-insensitive) table function names permitted in TABLE(...) invocations.
+    /// Default null: all table function invocations are rejected.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedTableFunctions { get; set; }
+
+    /// <summary>
+    /// SEC H-14: Allowlist of session property names permitted in WITH SESSION. Default null: WITH SESSION is rejected.
+    /// </summary>
+    public IReadOnlySet<string>? AllowedSessionProperties { get; set; }
+
+    /// <summary>
+    /// SEC H-14: When false (default), inline function definitions (WITH FUNCTION ...) are rejected.
+    /// </summary>
+    public bool AllowInlineFunctionDefinitions { get; set; } = false;
+
+    /// <summary>
+    /// SEC H-15: When true (default), UPDATE/DELETE statements referencing masked columns of the target table
+    /// in SET or WHERE are rejected (prevents copy-out and row-count oracles on masked data).
+    /// </summary>
+    public bool RejectMaskedColumnsInDml { get; set; } = true;
 }

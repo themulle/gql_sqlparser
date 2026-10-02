@@ -28,7 +28,11 @@ public sealed record SqlQueryMetadata(
     int MaxSubqueryDepth,
     bool HasExplicitLimit,
     long? ExplicitLimitValue,
-    IReadOnlySet<string>? JoinConditionColumns = null);
+    IReadOnlySet<string>? JoinConditionColumns = null,
+    IReadOnlyList<string>? FunctionCalls = null,
+    IReadOnlyList<string>? TableFunctionCalls = null,
+    bool HasSessionProperties = false,
+    bool HasInlineFunctionDefinitions = false);
 
 public interface ISqlQueryAnalyzer
 {

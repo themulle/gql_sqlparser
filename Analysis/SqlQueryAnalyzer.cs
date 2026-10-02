@@ -12,6 +12,11 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
     private readonly HashSet<string> _seenTableKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _joinConditionColumns = new(StringComparer.OrdinalIgnoreCase);
     private readonly Stack<HashSet<string>> _cteScopeStack = new();
+    private readonly List<string> _functionCalls = new();
+    private readonly HashSet<string> _seenFunctionCalls = new(StringComparer.Ordinal);
+    private readonly List<string> _tableFunctionCalls = new();
+    private bool _hasSessionProperties;
+    private bool _hasInlineFunctionDefinitions;
 
     private int _joinCount;
     private int _currentSubqueryDepth;
@@ -22,7 +27,7 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
 
     public SqlQueryAnalyzer()
     {
-        _cteScopeStack.Push(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        _cteScopeStack.Push(new HashSet<string>(StringComparer.Ordinal));
     }
 
     public SqlQueryMetadata Analyze(SqlBaseParser.SingleStatementContext statementContext)
@@ -40,7 +45,11 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
             MaxSubqueryDepth: _maxSubqueryDepth,
             HasExplicitLimit: _hasExplicitLimit,
             ExplicitLimitValue: _explicitLimitValue,
-            JoinConditionColumns: new HashSet<string>(_joinConditionColumns, StringComparer.OrdinalIgnoreCase));
+            JoinConditionColumns: new HashSet<string>(_joinConditionColumns, StringComparer.OrdinalIgnoreCase),
+            FunctionCalls: _functionCalls.ToArray(),
+            TableFunctionCalls: _tableFunctionCalls.ToArray(),
+            HasSessionProperties: _hasSessionProperties,
+            HasInlineFunctionDefinitions: _hasInlineFunctionDefinitions);
     }
 
     private void Reset()
@@ -51,7 +60,12 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         _seenTableKeys.Clear();
         _joinConditionColumns.Clear();
         _cteScopeStack.Clear();
-        _cteScopeStack.Push(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        _cteScopeStack.Push(new HashSet<string>(StringComparer.Ordinal));
+        _functionCalls.Clear();
+        _seenFunctionCalls.Clear();
+        _tableFunctionCalls.Clear();
+        _hasSessionProperties = false;
+        _hasInlineFunctionDefinitions = false;
         _joinCount = 0;
         _currentSubqueryDepth = 0;
         _maxSubqueryDepth = 0;
@@ -103,7 +117,41 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
 
     public override void EnterQuery(SqlBaseParser.QueryContext context)
     {
-        _cteScopeStack.Push(new HashSet<string>(_cteScopeStack.Peek(), StringComparer.OrdinalIgnoreCase));
+        _cteScopeStack.Push(new HashSet<string>(_cteScopeStack.Peek(), StringComparer.Ordinal));
+    }
+
+    // SEC C-01: collect called function names (lower-case, qualified as written).
+    public override void EnterFunctionCall(SqlBaseParser.FunctionCallContext context)
+    {
+        string name = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName()).ToLowerInvariant();
+        if (name.Length > 0 && _seenFunctionCalls.Add(name))
+        {
+            _functionCalls.Add(name);
+        }
+    }
+
+    // SEC H-14: table functions, WITH SESSION and WITH FUNCTION are surfaced for policy decisions.
+    public override void EnterTableFunctionInvocation(SqlBaseParser.TableFunctionInvocationContext context)
+    {
+        _tableFunctionCalls.Add(SqlIdentifierHelper.NormalizeQualifiedName(context.tableFunctionCall().qualifiedName()).ToLowerInvariant());
+    }
+
+    public override void EnterRootQueryWithSession(SqlBaseParser.RootQueryWithSessionContext context)
+    {
+        var properties = context.sessionProperty();
+        if (properties != null && properties.Length > 0)
+        {
+            _hasSessionProperties = true;
+        }
+    }
+
+    public override void EnterRootQuery(SqlBaseParser.RootQueryContext context)
+    {
+        var functions = context.functionSpecification();
+        if (functions != null && functions.Length > 0)
+        {
+            _hasInlineFunctionDefinitions = true;
+        }
     }
 
     public override void ExitQuery(SqlBaseParser.QueryContext context)
@@ -116,8 +164,9 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
 
     public override void ExitNamedQuery(SqlBaseParser.NamedQueryContext context)
     {
-        string cteName = SqlIdentifierHelper.NormalizeIdentifier(context.name.GetText());
-        _cteScopeStack.Peek().Add(cteName);
+        // SEC C-02: CTE names are single-part identifiers (folded scope key, never a dotted string).
+        string cteKey = SqlIdentifierHelper.FoldIdentifierForScope(context.name.GetText());
+        _cteScopeStack.Peek().Add(cteKey);
     }
 
     public override void EnterSubquery(SqlBaseParser.SubqueryContext context)
@@ -248,8 +297,9 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
 
     public override void EnterQueryNoWith(SqlBaseParser.QueryNoWithContext context)
     {
-        // Check top-level limit if encountered at root depth
-        if (_currentSubqueryDepth == 0 && context.limit != null)
+        // Check top-level limit only on the root query (SEC M-22: CTE bodies and subqueries do not count)
+        bool isRoot = context.Parent is SqlBaseParser.QueryContext query && query.Parent is SqlBaseParser.RootQueryContext;
+        if (isRoot && _currentSubqueryDepth == 0 && context.limit != null)
         {
             _hasExplicitLimit = true;
             if (context.limit.rowCount() != null)
@@ -300,8 +350,11 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
         string normalizedFullName = SqlIdentifierHelper.NormalizeQualifiedName(qualifiedNameContext);
         if (string.IsNullOrWhiteSpace(normalizedFullName)) return;
 
-        // Skip if this is a CTE in current scope
-        if (_cteScopeStack.Peek().Contains(normalizedFullName))
+        var ids = qualifiedNameContext.identifier();
+
+        // SEC C-02: Skip only single-part names that resolve to a CTE in the current scope.
+        if (ids != null && ids.Length == 1 &&
+            _cteScopeStack.Peek().Contains(SqlIdentifierHelper.FoldIdentifierForScope(ids[0].GetText())))
         {
             return;
         }
@@ -312,7 +365,6 @@ public sealed class SqlQueryAnalyzer : SqlBaseBaseListener, ISqlQueryAnalyzer
             alias = SqlIdentifierHelper.NormalizeIdentifier(aliasedRelation.identifier().GetText());
         }
 
-        var ids = qualifiedNameContext.identifier();
         string? catalog = null;
         string? schema = null;
         string tableName;

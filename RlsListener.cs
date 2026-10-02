@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Security;
 using Antlr4.Runtime;
+using Antlr4.Runtime.Tree;
 
 public static class SqlIdentifierHelper
 {
@@ -22,6 +23,51 @@ public static class SqlIdentifierHelper
             }
         }
         return id;
+    }
+
+    /// <summary>
+    /// SEC C-02: Scope key for single-part identifiers (CTE names). Unquoted identifiers are case-folded to lower case,
+    /// quoted identifiers keep their exact content (doubled quote characters are unescaped). Comparing keys ordinally
+    /// is therefore conservative for both case-insensitive (Trino) and case-sensitive quoted (PostgreSQL) semantics:
+    /// when in doubt a reference is treated as a physical table (and secured), never as a CTE.
+    /// </summary>
+    public static string FoldIdentifierForScope(string rawIdentifier)
+    {
+        if (string.IsNullOrWhiteSpace(rawIdentifier)) return string.Empty;
+        string id = rawIdentifier.Trim();
+        if (id.Length >= 2)
+        {
+            char first = id[0];
+            char last = id[^1];
+            if (first == '"' && last == '"') return id[1..^1].Replace("\"\"", "\"", StringComparison.Ordinal);
+            if (first == '`' && last == '`') return id[1..^1].Replace("``", "`", StringComparison.Ordinal);
+            if (first == '[' && last == ']') return id[1..^1];
+        }
+        return id.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// SEC M-24: Quotes a catalog-provided column name as a delimited SQL identifier ("..." with doubled quotes).
+    /// </summary>
+    public static string QuoteIdentifier(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        return "\"" + name.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+    }
+
+    /// <summary>
+    /// SEC M-23: Removes exactly one pair of enclosing single quotes and unescapes doubled quotes ('' -> ').
+    /// Values without enclosing single quotes are returned trimmed but otherwise unchanged.
+    /// </summary>
+    public static string UnquoteStringLiteral(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        string v = value.Trim();
+        if (v.Length >= 2 && v[0] == '\'' && v[^1] == '\'')
+        {
+            return v[1..^1].Replace("''", "'", StringComparison.Ordinal);
+        }
+        return v;
     }
 
     public static string NormalizeQualifiedName(SqlBaseParser.QualifiedNameContext context)
@@ -42,12 +88,13 @@ public sealed class RlsListener : SqlBaseBaseListener
     private readonly TokenStreamRewriter _rewriter;
     private readonly RlsOptions _options;
     private readonly Stack<HashSet<string>> _cteScopeStack = new();
+    private bool _rootLimitHandled = false;
 
     public RlsListener(ITokenStream tokens, RlsOptions? options = null)
     {
         _rewriter = new TokenStreamRewriter(tokens);
         _options = options ?? new RlsOptions();
-        _cteScopeStack.Push(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        _cteScopeStack.Push(new HashSet<string>(StringComparer.Ordinal));
     }
 
     // SEC-01: Statement validation based on EnforceReadOnlyQueries
@@ -77,10 +124,60 @@ public sealed class RlsListener : SqlBaseBaseListener
         }
     }
 
+    // SEC H-14: WITH SESSION is rejected unless every property is allowlisted.
+    public override void EnterRootQueryWithSession(SqlBaseParser.RootQueryWithSessionContext context)
+    {
+        var properties = context.sessionProperty();
+        if (properties == null || properties.Length == 0) return;
+
+        foreach (var property in properties)
+        {
+            string name = SqlIdentifierHelper.NormalizeQualifiedName(property.qualifiedName());
+            if (_options.AllowedSessionProperties == null ||
+                !SqlFunctionPolicy.ContainsIgnoreCase(_options.AllowedSessionProperties, name))
+            {
+                throw new SecurityException($"WITH SESSION property '{name}' is not permitted.");
+            }
+        }
+    }
+
+    // SEC H-14: Inline function definitions (WITH FUNCTION ...) are rejected by default.
+    public override void EnterRootQuery(SqlBaseParser.RootQueryContext context)
+    {
+        var functions = context.functionSpecification();
+        if (functions != null && functions.Length > 0 && !_options.AllowInlineFunctionDefinitions)
+        {
+            throw new SecurityException("Inline function definitions (WITH FUNCTION) are not permitted.");
+        }
+    }
+
+    // SEC H-14: Table functions (TABLE(fn(...))) may execute raw SQL on the connector; allowlist only.
+    public override void EnterTableFunctionInvocation(SqlBaseParser.TableFunctionInvocationContext context)
+    {
+        string name = SqlIdentifierHelper.NormalizeQualifiedName(context.tableFunctionCall().qualifiedName());
+        if (_options.AllowedTableFunctions == null ||
+            !SqlFunctionPolicy.ContainsIgnoreCase(_options.AllowedTableFunctions, name))
+        {
+            throw new SecurityException($"Table function '{name}' is not permitted.");
+        }
+    }
+
+    // SEC C-01: Function policy (denylist / optional allowlist).
+    public override void EnterFunctionCall(SqlBaseParser.FunctionCallContext context)
+    {
+        if (!_options.EnforceFunctionPolicy) return;
+
+        string name = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
+        if (!SqlFunctionPolicy.IsFunctionAllowed(name, _options))
+        {
+            throw new SecurityException($"Function '{name}' is not permitted by the SQL function policy.");
+        }
+    }
+
     // SEC-05: Lexical CTE Scoping
     public override void EnterQuery(SqlBaseParser.QueryContext context)
     {
-        _cteScopeStack.Push(new HashSet<string>(_cteScopeStack.Peek(), StringComparer.OrdinalIgnoreCase));
+        _cteScopeStack.Push(new HashSet<string>(_cteScopeStack.Peek(), StringComparer.Ordinal));
     }
 
     public override void ExitQuery(SqlBaseParser.QueryContext context)
@@ -94,71 +191,74 @@ public sealed class RlsListener : SqlBaseBaseListener
     // SEC-CTE: Add CTE name to scope on EXIT, NOT on enter.
     // In SQL standard, a CTE query cannot reference itself unless recursive, and shadowing
     // a physical table must NOT bypass physical table RLS filters inside the CTE definition.
+    // SEC C-02: CTE names are single-part identifiers; stored as folded scope key, never as dotted string.
     public override void ExitNamedQuery(SqlBaseParser.NamedQueryContext context)
     {
-        string cteName = SqlIdentifierHelper.NormalizeIdentifier(context.name.GetText());
-        _cteScopeStack.Peek().Add(cteName);
+        string cteKey = SqlIdentifierHelper.FoldIdentifierForScope(context.name.GetText());
+        _cteScopeStack.Peek().Add(cteKey);
     }
 
-    private int _subqueryDepth = 0;
-    private bool _rootLimitHandled = false;
-
-    public override void EnterSubquery(SqlBaseParser.SubqueryContext context)
+    /// <summary>
+    /// SEC M-22: The enforced LIMIT belongs to the root queryNoWith of a read statement only
+    /// (statementDefault -> rootQueryWithSession -> rootQuery -> query -> queryNoWith).
+    /// CTE bodies, IN/EXISTS/scalar subqueries and derived tables can no longer consume it.
+    /// </summary>
+    private static bool IsRootReadQueryNoWith(SqlBaseParser.QueryNoWithContext context)
     {
-        _subqueryDepth++;
-    }
-
-    public override void ExitSubquery(SqlBaseParser.SubqueryContext context)
-    {
-        if (_subqueryDepth > 0) _subqueryDepth--;
-    }
-
-    public override void EnterSubqueryRelation(SqlBaseParser.SubqueryRelationContext context)
-    {
-        _subqueryDepth++;
-    }
-
-    public override void ExitSubqueryRelation(SqlBaseParser.SubqueryRelationContext context)
-    {
-        if (_subqueryDepth > 0) _subqueryDepth--;
+        return context.Parent is SqlBaseParser.QueryContext query &&
+               query.Parent is SqlBaseParser.RootQueryContext rootQuery &&
+               rootQuery.Parent is SqlBaseParser.RootQueryWithSessionContext rootWithSession &&
+               rootWithSession.Parent is SqlBaseParser.StatementDefaultContext;
     }
 
     public override void EnterQueryNoWith(SqlBaseParser.QueryNoWithContext context)
     {
-        if (_options.EnforcedMaxRows > 0 && _subqueryDepth == 0 && !_rootLimitHandled)
+        if (_options.EnforcedMaxRows <= 0 || _rootLimitHandled || !IsRootReadQueryNoWith(context))
+            return;
+
+        string maxRows = _options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        if (context.limit != null)
         {
-            if (context.limit != null)
+            _rootLimitHandled = true;
+            var rowCount = context.limit.rowCount();
+            if (rowCount != null)
             {
-                _rootLimitHandled = true;
-                if (context.limit.rowCount() != null)
+                if (!long.TryParse(rowCount.GetText(), out long existingVal) || existingVal > _options.EnforcedMaxRows)
                 {
-                    string text = context.limit.rowCount().GetText();
-                    if (long.TryParse(text, out long existingVal))
-                    {
-                        if (existingVal > _options.EnforcedMaxRows)
-                        {
-                            _rewriter.Replace(context.limit.rowCount().Start, context.limit.rowCount().Stop, _options.EnforcedMaxRows.ToString());
-                        }
-                    }
-                    else
-                    {
-                        _rewriter.Replace(context.limit.rowCount().Start, context.limit.rowCount().Stop, _options.EnforcedMaxRows.ToString());
-                    }
+                    _rewriter.Replace(rowCount.Start, rowCount.Stop, maxRows);
                 }
-                else if (context.limit.ALL() != null)
+            }
+            else if (context.limit.ALL() != null)
+            {
+                _rewriter.Replace(context.limit.ALL().Symbol, maxRows);
+            }
+        }
+        else if (context.FETCH() != null)
+        {
+            _rootLimitHandled = true;
+            if (context.fetchFirst != null)
+            {
+                if (!long.TryParse(context.fetchFirst.GetText(), out long existingVal) || existingVal > _options.EnforcedMaxRows)
                 {
-                    _rewriter.Replace(context.limit.ALL().Symbol, _options.EnforcedMaxRows.ToString());
+                    _rewriter.Replace(context.fetchFirst.Start, context.fetchFirst.Stop, maxRows);
                 }
+            }
+
+            // WITH TIES may return more rows than requested; downgrade to ONLY.
+            if (context.TIES() != null && context.WITH() != null)
+            {
+                _rewriter.Replace(context.WITH().Symbol, context.TIES().Symbol, "ONLY");
             }
         }
     }
 
     public override void ExitQueryNoWith(SqlBaseParser.QueryNoWithContext context)
     {
-        if (_options.EnforcedMaxRows > 0 && _subqueryDepth == 0 && !_rootLimitHandled)
+        if (_options.EnforcedMaxRows > 0 && !_rootLimitHandled && IsRootReadQueryNoWith(context))
         {
             _rootLimitHandled = true;
-            _rewriter.InsertAfter(context.Stop, $" LIMIT {_options.EnforcedMaxRows}");
+            _rewriter.InsertAfter(context.Stop, $" LIMIT {_options.EnforcedMaxRows.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         }
     }
 
@@ -168,7 +268,7 @@ public sealed class RlsListener : SqlBaseBaseListener
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName))
+        if (IsCte(context.qualifiedName()))
             return;
 
         bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
@@ -187,7 +287,7 @@ public sealed class RlsListener : SqlBaseBaseListener
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName))
+        if (IsCte(context.qualifiedName()))
             return;
 
         bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
@@ -206,7 +306,7 @@ public sealed class RlsListener : SqlBaseBaseListener
         string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName))
+        if (IsCte(context.qualifiedName()))
             return;
 
         bool shouldApplyRls = _options.PolicyProvider.ShouldApplyPolicy(normalizedName);
@@ -222,10 +322,15 @@ public sealed class RlsListener : SqlBaseBaseListener
     // DML: DELETE FROM <table> [WHERE <predicate>]
     public override void EnterDelete(SqlBaseParser.DeleteContext context)
     {
-        string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
 
-        if (IsCte(normalizedName) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
+        // SEC H-15: masked columns must not be usable as row-count oracle in WHERE.
+        if (context.booleanExpression() != null)
+        {
+            EnsureNoMaskedColumnReferences(normalizedName, context.booleanExpression(), "DELETE WHERE");
+        }
+
+        if (IsCte(context.qualifiedName()) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
             return;
 
         string policyFilter = _options.PolicyProvider.GetPolicyFilter(normalizedName);
@@ -244,15 +349,28 @@ public sealed class RlsListener : SqlBaseBaseListener
     // DML: UPDATE <table> SET <assignments> [WHERE <predicate>]
     public override void EnterUpdate(SqlBaseParser.UpdateContext context)
     {
-        string rawName = context.qualifiedName().GetText();
         string normalizedName = SqlIdentifierHelper.NormalizeQualifiedName(context.qualifiedName());
+        var assignments = context.updateAssignment();
+
+        // SEC H-15: masked columns must neither be written/copied in SET nor probed in WHERE.
+        if (assignments != null)
+        {
+            foreach (var assignment in assignments)
+            {
+                EnsureNoMaskedColumnReferences(normalizedName, assignment, "UPDATE SET");
+            }
+        }
+        if (context.where != null)
+        {
+            EnsureNoMaskedColumnReferences(normalizedName, context.where, "UPDATE WHERE");
+        }
 
         // 1. WITH CHECK OPTION verification on assignments
-        if (_options.EnforceWithCheckOption && context.updateAssignment() != null)
+        if (_options.EnforceWithCheckOption && assignments != null)
         {
-            string expectedTenant = _options.ExpectedTenantValue.Trim('\'', '"');
+            string expectedTenant = SqlIdentifierHelper.UnquoteStringLiteral(_options.ExpectedTenantValue);
 
-            foreach (var assignment in context.updateAssignment())
+            foreach (var assignment in assignments)
             {
                 string colName = SqlIdentifierHelper.NormalizeIdentifier(assignment.identifier().GetText());
                 if (colName.Equals(_options.TenantColumnName, StringComparison.OrdinalIgnoreCase))
@@ -262,17 +380,13 @@ public sealed class RlsListener : SqlBaseBaseListener
                         throw new SecurityException($"Modification of tenant column '{colName}' is not allowed in UPDATE statement.");
                     }
 
-                    string assignedVal = assignment.expression().GetText().Trim('\'', '"');
-                    if (!assignedVal.Equals(expectedTenant, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new SecurityException($"Tenant column '{colName}' assignment value '{assignedVal}' does not match expected tenant '{expectedTenant}'.");
-                    }
+                    EnsureTenantLiteral(assignment.expression(), expectedTenant, "UPDATE");
                 }
             }
         }
 
         // 2. WHERE clause injection
-        if (IsCte(normalizedName) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
+        if (IsCte(context.qualifiedName()) || !_options.PolicyProvider.ShouldApplyPolicy(normalizedName))
             return;
 
         string policyFilter = _options.PolicyProvider.GetPolicyFilter(normalizedName);
@@ -320,99 +434,155 @@ public sealed class RlsListener : SqlBaseBaseListener
             return;
         }
 
-        var rootQuery = context.rootQuery();
-        if (rootQuery == null)
-            return;
-
-        string expectedTenant = _options.ExpectedTenantValue.Trim('\'', '"');
-
-        // A: Check inline VALUES clause
-        var inlineTable = FindInlineTable(rootQuery);
-        if (inlineTable != null)
+        var queryNoWith = context.rootQuery()?.query()?.queryNoWith();
+        if (queryNoWith == null)
         {
-            var rowExpressions = inlineTable.expression();
-            if (rowExpressions != null)
-            {
-                foreach (var rowExpr in rowExpressions)
+            throw new SecurityException("INSERT statement without a verifiable source query is not allowed.");
+        }
+
+        // SEC M-23: verify every VALUES row and every branch of set operations; non-literals are rejected.
+        string expectedTenant = SqlIdentifierHelper.UnquoteStringLiteral(_options.ExpectedTenantValue);
+        VerifyInsertQueryTerm(queryNoWith.queryTerm(), tenantIndex, expectedTenant);
+    }
+
+    private void VerifyInsertQueryTerm(SqlBaseParser.QueryTermContext? term, int tenantIndex, string expectedTenant)
+    {
+        switch (term)
+        {
+            case SqlBaseParser.SetOperationContext setOperation:
+                VerifyInsertQueryTerm(setOperation.left, tenantIndex, expectedTenant);
+                VerifyInsertQueryTerm(setOperation.right, tenantIndex, expectedTenant);
+                return;
+            case SqlBaseParser.QueryTermDefaultContext termDefault:
+                VerifyInsertQueryPrimary(termDefault.queryPrimary(), tenantIndex, expectedTenant);
+                return;
+            default:
+                throw new SecurityException("INSERT source query shape cannot be verified against the tenant WITH CHECK OPTION.");
+        }
+    }
+
+    private void VerifyInsertQueryPrimary(SqlBaseParser.QueryPrimaryContext? primary, int tenantIndex, string expectedTenant)
+    {
+        switch (primary)
+        {
+            case SqlBaseParser.InlineTableContext inlineTable:
                 {
-                    var values = ExtractRowExpressions(rowExpr);
-                    if (values != null && tenantIndex < values.Count)
+                    var rows = inlineTable.expression();
+                    if (rows == null || rows.Length == 0)
                     {
-                        string valText = values[tenantIndex].GetText().Trim('\'', '"');
-                        if (!valText.Equals(expectedTenant, StringComparison.OrdinalIgnoreCase))
+                        throw new SecurityException("INSERT VALUES clause without rows cannot be verified.");
+                    }
+
+                    foreach (var row in rows)
+                    {
+                        var values = ExtractRowValues(row);
+                        if (tenantIndex >= values.Count)
                         {
-                            throw new SecurityException($"Tenant column '{_options.TenantColumnName}' inserted value '{valText}' does not match expected tenant '{expectedTenant}'.");
+                            throw new SecurityException($"Tenant column '{_options.TenantColumnName}' has no value in an INSERT VALUES row.");
+                        }
+                        EnsureTenantLiteral(values[tenantIndex], expectedTenant, "INSERT");
+                    }
+                    return;
+                }
+            case SqlBaseParser.QueryPrimaryDefaultContext primaryDefault:
+                {
+                    var items = primaryDefault.querySpecification().selectItem();
+                    if (items == null)
+                    {
+                        throw new SecurityException("INSERT SELECT without projection cannot be verified.");
+                    }
+
+                    // A '*' before or at the tenant position makes the column mapping unverifiable.
+                    for (int i = 0; i < items.Length && i <= tenantIndex; i++)
+                    {
+                        if (items[i] is not SqlBaseParser.SelectSingleContext)
+                        {
+                            throw new SecurityException($"Tenant column '{_options.TenantColumnName}' in INSERT SELECT cannot be verified (wildcard projection).");
                         }
                     }
-                }
-            }
-        }
 
-        // B: Check INSERT INTO ... SELECT constant/literal projections
-        var querySpec = FindQuerySpecification(rootQuery);
-        if (querySpec != null)
-        {
-            var items = querySpec.selectItem();
-            if (items != null && tenantIndex < items.Length)
-            {
-                if (items[tenantIndex] is SqlBaseParser.SelectSingleContext singleItem && singleItem.expression() != null)
-                {
-                    var expr = singleItem.expression();
-                    // If expression is a primary literal (number, string)
-                    string text = expr.GetText().Trim('\'', '"');
-                    if (IsLiteralConstant(expr) && !text.Equals(expectedTenant, StringComparison.OrdinalIgnoreCase))
+                    if (tenantIndex >= items.Length || items[tenantIndex] is not SqlBaseParser.SelectSingleContext single || single.expression() == null)
                     {
-                        throw new SecurityException($"Tenant column '{_options.TenantColumnName}' in INSERT SELECT value '{text}' does not match expected tenant '{expectedTenant}'.");
+                        throw new SecurityException($"Tenant column '{_options.TenantColumnName}' has no value in INSERT SELECT.");
                     }
+
+                    EnsureTenantLiteral(single.expression(), expectedTenant, "INSERT SELECT");
+                    return;
                 }
-            }
+            case SqlBaseParser.SubqueryContext subquery:
+                VerifyInsertQueryTerm(subquery.queryNoWith()?.queryTerm(), tenantIndex, expectedTenant);
+                return;
+            default:
+                throw new SecurityException("INSERT source query shape cannot be verified against the tenant WITH CHECK OPTION.");
         }
     }
 
-    private static bool IsLiteralConstant(SqlBaseParser.ExpressionContext expr)
+    private void EnsureTenantLiteral(SqlBaseParser.ExpressionContext? expr, string expectedTenant, string operation)
     {
-        // Simple check: if expression text is purely numeric or quoted string
-        string t = expr.GetText();
-        if (string.IsNullOrWhiteSpace(t)) return false;
-        if (long.TryParse(t, out _) || double.TryParse(t, out _)) return true;
-        if ((t.StartsWith('\'') && t.EndsWith('\'')) || (t.StartsWith('"') && t.EndsWith('"'))) return true;
-        return false;
+        string? literal = TryGetLiteralValue(expr);
+        if (literal == null)
+        {
+            throw new SecurityException($"Tenant column '{_options.TenantColumnName}' in {operation} must be a literal value.");
+        }
+
+        if (!literal.Equals(expectedTenant, StringComparison.Ordinal))
+        {
+            throw new SecurityException($"Tenant column '{_options.TenantColumnName}' {operation} value '{literal}' does not match expected tenant '{expectedTenant}'.");
+        }
     }
 
-    private static SqlBaseParser.InlineTableContext? FindInlineTable(RuleContext? ctx)
+    /// <summary>
+    /// SEC M-23: Returns the value of a plain string or unsigned integer/decimal literal (optionally parenthesized), otherwise null.
+    /// </summary>
+    private static string? TryGetLiteralValue(SqlBaseParser.ExpressionContext? expr)
     {
-        if (ctx == null) return null;
-        if (ctx is SqlBaseParser.InlineTableContext inlineTable) return inlineTable;
-        for (int i = 0; i < ctx.ChildCount; i++)
+        var primary = UnwrapPrimary(expr);
+        if (primary is not SqlBaseParser.LiteralsContext literals)
+            return null;
+
+        var literal = literals.literal();
+        if (literal == null || literal.Start == null || literal.Start.TokenIndex != literal.Stop?.TokenIndex)
+            return null;
+
+        int tokenType = literal.Start.Type;
+        if (literal is SqlBaseParser.StringLiteralContext && tokenType == SqlBaseLexer.STRING)
         {
-            if (ctx.GetChild(i) is RuleContext child)
+            return SqlIdentifierHelper.UnquoteStringLiteral(literal.Start.Text);
+        }
+
+        if (literal is SqlBaseParser.NumericLiteralContext &&
+            (tokenType == SqlBaseLexer.INTEGER_VALUE || tokenType == SqlBaseLexer.DECIMAL_VALUE))
+        {
+            return literal.Start.Text;
+        }
+
+        return null;
+    }
+
+    private static SqlBaseParser.PrimaryExpressionContext? UnwrapPrimary(SqlBaseParser.ExpressionContext? expr)
+    {
+        while (expr != null)
+        {
+            if (expr.booleanExpression() is not SqlBaseParser.PredicatedContext predicated || predicated.predicate() != null)
+                return null;
+            if (predicated.valueExpression() is not SqlBaseParser.ValueExpressionDefaultContext valueDefault)
+                return null;
+
+            var primary = valueDefault.primaryExpression();
+            if (primary is SqlBaseParser.ParenthesizedExpressionContext parenthesized)
             {
-                var found = FindInlineTable(child);
-                if (found != null) return found;
+                expr = parenthesized.expression();
+                continue;
             }
+            return primary;
         }
         return null;
     }
 
-    private static SqlBaseParser.QuerySpecificationContext? FindQuerySpecification(RuleContext? ctx)
+    private static IReadOnlyList<SqlBaseParser.ExpressionContext> ExtractRowValues(SqlBaseParser.ExpressionContext rowExpr)
     {
-        if (ctx == null) return null;
-        if (ctx is SqlBaseParser.QuerySpecificationContext spec) return spec;
-        for (int i = 0; i < ctx.ChildCount; i++)
-        {
-            if (ctx.GetChild(i) is RuleContext child)
-            {
-                var found = FindQuerySpecification(child);
-                if (found != null) return found;
-            }
-        }
-        return null;
-    }
-
-    private static IReadOnlyList<SqlBaseParser.ExpressionContext>? ExtractRowExpressions(SqlBaseParser.ExpressionContext expr)
-    {
-        var row = FindRowConstructor(expr);
-        if (row != null)
+        var primary = UnwrapPrimary(rowExpr);
+        if (primary is SqlBaseParser.RowConstructorContext row)
         {
             var exprs = row.expression();
             if (exprs != null && exprs.Length > 0)
@@ -430,27 +600,56 @@ public sealed class RlsListener : SqlBaseBaseListener
             }
         }
 
-        return new[] { expr };
+        return new[] { rowExpr };
     }
 
-    private static SqlBaseParser.RowConstructorContext? FindRowConstructor(RuleContext? ctx)
+    /// <summary>
+    /// SEC H-15: Rejects DML that references masked (or denied, i.e. masked as NULL) columns of the target table.
+    /// </summary>
+    private void EnsureNoMaskedColumnReferences(string normalizedTableName, ParserRuleContext scope, string clause)
     {
-        if (ctx == null) return null;
-        if (ctx is SqlBaseParser.RowConstructorContext row) return row;
-        for (int i = 0; i < ctx.ChildCount; i++)
+        if (!_options.RejectMaskedColumnsInDml || _options.ColumnMaskingProvider == null)
+            return;
+
+        var stack = new Stack<IParseTree>();
+        stack.Push(scope);
+        while (stack.Count > 0)
         {
-            if (ctx.GetChild(i) is RuleContext child)
+            var node = stack.Pop();
+            string? candidate = node switch
             {
-                var found = FindRowConstructor(child);
-                if (found != null) return found;
+                SqlBaseParser.UpdateAssignmentContext assignment => assignment.identifier()?.GetText(),
+                SqlBaseParser.ColumnReferenceContext columnRef => columnRef.identifier()?.GetText(),
+                SqlBaseParser.DereferenceContext dereference => dereference.fieldName?.GetText(),
+                _ => null
+            };
+
+            if (candidate != null)
+            {
+                string column = SqlIdentifierHelper.NormalizeIdentifier(candidate);
+                if (column.Length > 0 && _options.ColumnMaskingProvider.HasMask(normalizedTableName, column))
+                {
+                    throw new SecurityException($"Masked column '{column}' of table '{normalizedTableName}' must not be referenced in {clause}.");
+                }
+            }
+
+            for (int i = 0; i < node.ChildCount; i++)
+            {
+                stack.Push(node.GetChild(i));
             }
         }
-        return null;
     }
 
-    private bool IsCte(string normalizedTableName)
+    /// <summary>
+    /// SEC C-02: Only single-part names can refer to a CTE. Qualified names (schema.table) are always physical tables.
+    /// </summary>
+    private bool IsCte(SqlBaseParser.QualifiedNameContext qualifiedName)
     {
-        return _cteScopeStack.Peek().Contains(normalizedTableName);
+        var ids = qualifiedName.identifier();
+        if (ids == null || ids.Length != 1)
+            return false;
+
+        return _cteScopeStack.Peek().Contains(SqlIdentifierHelper.FoldIdentifierForScope(ids[0].GetText()));
     }
 
     private bool HasMaskingForTable(string normalizedTableName)
@@ -484,14 +683,16 @@ public sealed class RlsListener : SqlBaseBaseListener
                 var projected = new List<string>(columns.Count);
                 foreach (var col in columns)
                 {
+                    // SEC M-24: catalog column names are always emitted as delimited identifiers.
+                    string quotedCol = SqlIdentifierHelper.QuoteIdentifier(col);
                     if (_options.ColumnMaskingProvider != null && _options.ColumnMaskingProvider.HasMask(normalizedTableName, col))
                     {
                         string maskExpr = _options.ColumnMaskingProvider.GetMaskedExpression(normalizedTableName, col);
-                        projected.Add($"{maskExpr} AS {col}");
+                        projected.Add($"{maskExpr} AS {quotedCol}");
                     }
                     else
                     {
-                        projected.Add(col);
+                        projected.Add(quotedCol);
                     }
                 }
                 selectColumns = string.Join(", ", projected);

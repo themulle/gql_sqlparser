@@ -262,7 +262,9 @@ public class TrinoParserComplianceTests
     {
         var engine = new FastSqlEngine();
         string sql = "SELECT * FROM TABLE(my_ptf(TABLE(orders)))";
-        string secured = engine.RewriteRls(sql.AsMemory());
+        // SEC H-14: table functions are rejected unless allowlisted.
+        var options = new RlsOptions { AllowedTableFunctions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "my_ptf" } };
+        string secured = engine.RewriteRls(sql.AsMemory(), options);
 
         Assert.Equal("SELECT * FROM TABLE(my_ptf(TABLE((SELECT * FROM orders WHERE tenant_id = 42))))", secured);
     }
